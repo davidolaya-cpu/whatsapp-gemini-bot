@@ -1,7 +1,7 @@
 import os
 import requests
 from flask import Flask, request, jsonify
-import google.generativeai as genai
+from google import genai
 
 app = Flask(__name__)
 
@@ -10,8 +10,7 @@ WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 @app.route("/webhook", methods=["GET"])
 def verify():
@@ -28,7 +27,7 @@ def webhook():
         message = data["entry"][0]["changes"][0]["value"]["messages"][0]
         phone = message["from"]
         text = message["text"]["body"]
-        response = model.generate_content(text)
+        response = client.models.generate_content(model="gemini-2.0-flash", contents=text)
         reply = response.text
         send_message(phone, reply)
     except Exception as e:
@@ -50,5 +49,5 @@ def send_message(phone, message):
     requests.post(url, headers=headers, json=payload)
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
