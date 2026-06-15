@@ -1,8 +1,13 @@
 import os
+import re
+import json
 import requests
+from datetime import datetime
 from flask import Flask, request, jsonify
 from google import genai
 from google.genai import types
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
 app = Flask(__name__)
 
@@ -10,10 +15,33 @@ VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN")
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-
+GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS")
+SHEET_ID = "1lvlIK1LYbT68HsuDTbMRzWSYhRGUPHAZeV31_sAmdU"
 ADMIN_PHONE = "573229082927"
 
 client = genai.Client(api_key=GEMINI_API_KEY)
+
+def get_sheets_service():
+    creds_dict = json.loads(GOOGLE_CREDENTIALS)
+    creds = service_account.Credentials.from_service_account_info(
+        creds_dict,
+        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    return build("sheets", "v4", credentials=creds)
+
+def registrar_cliente(phone, mensaje, servicio, estado):
+    try:
+        service = get_sheets_service()
+        fecha = datetime.now().strftime("%d/%m/%Y %H:%M")
+        valores = [[fecha, f"+{phone}", mensaje, servicio, estado]]
+        service.spreadsheets().values().append(
+            spreadsheetId=SHEET_ID,
+            range="A:E",
+            valueInputOption="RAW",
+            body={"values": valores}
+        ).execute()
+    except Exception as e:
+        print(f"Error registrando en Sheets: {e}")
 
 BIENVENIDA = """🎮 ¡Bienvenido a *Game Line Col*! 🎮
 
@@ -145,37 +173,39 @@ def webhook():
         if phone not in conversaciones or es_saludo:
             conversaciones[phone] = {"activo": True, "estado": "menu"}
             send_message(phone, BIENVENIDA)
+            registrar_cliente(phone, text, "Inicio", "Bienvenida enviada")
             return jsonify({"status": "ok"}), 200
 
         estado = conversaciones[phone].get("estado", "menu")
 
-        # Opciones del menú principal
         if text == "1" or "game pass" in text_lower:
             conversaciones[phone]["estado"] = "gamepass"
             send_message(phone, GAMEPASS)
+            registrar_cliente(phone, text, "Game Pass Ultimate", "Consultó precios")
             return jsonify({"status": "ok"}), 200
 
         if text == "2" or text_lower in ["juegos", "juego", "juegos xbox"]:
             conversaciones[phone]["estado"] = "juegos"
             send_message(phone, JUEGOS_MENU)
+            registrar_cliente(phone, text, "Juegos Xbox", "Consultó juegos")
             return jsonify({"status": "ok"}), 200
 
         if text == "3" or "soporte" in text_lower:
             conversaciones[phone]["estado"] = "soporte"
             send_message(phone, SOPORTE)
+            registrar_cliente(phone, text, "Soporte", "Solicitó soporte")
             alerta = f"🚨 *SOPORTE Game Line Col* 🚨\n\nEl cliente *+{phone}* solicitó soporte."
             send_message(ADMIN_PHONE, alerta)
             return jsonify({"status": "ok"}), 200
 
-        # Cliente dice SÍ para contratar Game Pass
         if estado == "gamepass" and text_lower in ["si", "sí", "yes", "quiero", "dale", "listo"]:
             conversaciones[phone]["estado"] = "activacion"
             send_message(phone, ACTIVACION)
+            registrar_cliente(phone, text, "Game Pass Ultimate", "Quiere contratar ✅")
             alerta = f"🎮 *NUEVO CLIENTE - Game Line Col* 🎮\n\nEl cliente *+{phone}* quiere contratar Game Pass Ultimate.\n\n¡Espera su código de activación! 🚀"
             send_message(ADMIN_PHONE, alerta)
             return jsonify({"status": "ok"}), 200
 
-        # Respuesta con IA para todo lo demás
         response = client.models.generate_content(
             model="gemini-2.5-flash-lite",
             contents=f"{SYSTEM_PROMPT}\n\nEstado actual del cliente: {estado}\n\nCliente dice: {text}",
@@ -186,17 +216,21 @@ def webhook():
         reply = response.text
 
         if "ALERTA_JUEGO:" in reply:
-            import re
             match = re.search(r'ALERTA_JUEGO:([^\n]+)', reply)
             nombre_juego = match.group(1).strip() if match else text
             reply = re.sub(r'ALERTA_JUEGO:[^\n]+', '', reply).strip()
+            registrar_cliente(phone, text, f"Juego: {nombre_juego}", "Cotización solicitada 🎮")
             alerta = f"🎮 *COTIZACIÓN DE JUEGO - Game Line Col* 🎮\n\nEl cliente *+{phone}* busca:\n👉 *{nombre_juego}*\n\nPor favor cotiza y respóndele."
             send_message(ADMIN_PHONE, alerta)
 
         elif "ALERTA_ASESOR" in reply:
             reply = reply.replace("ALERTA_ASESOR", "").strip()
+            registrar_cliente(phone, text, "Consulta general", "Necesita asesor 🚨")
             alerta = f"🚨 *ALERTA Game Line Col* 🚨\n\nEl cliente *+{phone}* necesita un asesor.\n\n💬 Su pregunta:\n_{text}_"
             send_message(ADMIN_PHONE, alerta)
+
+        else:
+            registrar_cliente(phone, text, "Consulta general", "Respondido por bot ✅")
 
         send_message(phone, reply)
 
