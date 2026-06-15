@@ -11,16 +11,34 @@ WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
+ADMIN_PHONE = "573229082927"
+
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 BIENVENIDA = """🎮 ¡Bienvenido a *Game Line Col*! 🎮
 
-Somos tu tienda de confianza para:
-✅ Cuentas de *Game Pass* para Xbox y PC
-✅ *Juegos para Xbox* a los mejores precios
+Somos tu tienda de confianza para juegos y suscripciones Xbox 🕹️
+
+¿En qué te podemos ayudar hoy?
+
+1️⃣ *Game Pass Ultimate* (Xbox y PC)
+2️⃣ *Juegos Xbox*
+3️⃣ *Soporte*
+
+Responde con el número de tu opción 😊"""
+
+MENU = """¿En qué más te puedo ayudar? 😊
+
+1️⃣ *Game Pass Ultimate* (Xbox y PC)
+2️⃣ *Juegos Xbox*
+3️⃣ *Soporte*"""
+
+GAMEPASS = """🕹️ *GAME PASS ULTIMATE - Xbox y PC* 🕹️
+
+Con Game Pass Ultimate tienes acceso a cientos de juegos en Xbox y PC.
 
 ━━━━━━━━━━━━━━━━
-🕹️ *PLANES GAME PASS*
+💰 *PRECIOS*
 ━━━━━━━━━━━━━━━━
 📅 1 mes → $29.900
 📅 2 meses → $55.000
@@ -29,56 +47,86 @@ Somos tu tienda de confianza para:
 📅 12 meses → $190.000
 
 ━━━━━━━━━━━━━━━━
-🛡️ *NUESTRA GARANTÍA*
+🛡️ *GARANTÍA*
 ━━━━━━━━━━━━━━━━
-Primero pruebas el servicio y luego pagas. ¡Tu satisfacción es nuestra prioridad!
+✅ Primero pruebas el servicio
+✅ Solo pagas cuando estés satisfecho
 
 ━━━━━━━━━━━━━━━━
 💳 *PAGO*
 ━━━━━━━━━━━━━━━━
-Llave Breve Falabella al 3057059517
+Llave Breve Falabella al *3057059517*
 
-¿En qué te puedo ayudar hoy? 😊"""
+━━━━━━━━━━━━━━━━
+📲 *¿CÓMO ACTIVARLO?*
+━━━━━━━━━━━━━━━━
+Sigue estos pasos en tu consola:
 
-SYSTEM_PROMPT = """Eres un asistente virtual de Game Line Col, una tienda colombiana especializada en la venta de cuentas de Game Pass para Xbox y PC, así como juegos para Xbox.
+1️⃣ Ve a *"Agregar nuevo"* (como si fueras a agregar una nueva cuenta)
+2️⃣ Selecciona *"Usar otro dispositivo"*
+3️⃣ Copia el código alfanumérico que aparece y *envíalo aquí* 📩
 
-Tu nombre es GameBot y debes responder siempre en español, de forma amable, clara y profesional. Usa emojis ocasionalmente para hacer la conversación más amena 🎮
+¿Te gustaría contratar el servicio? Responde *SÍ* y envíanos el código 🎮"""
 
-PRECIOS DE GAME PASS:
-- 1 mes: $29.900
-- 2 meses: $55.000
-- 3 meses: $80.000
-- 6 meses: $140.000
-- 12 meses: $190.000
+JUEGOS = """🎮 *JUEGOS XBOX* 🎮
 
-MÉTODO DE ENTREGA:
-- El servicio se entrega de forma remota por WhatsApp
-- El cliente debe generar un código desde su consola Xbox o PC y enviarlo al asesor
-- Con ese código se hace el logueo de la cuenta de forma remota
-- Es un proceso sencillo y rápido
+Tenemos 4 modalidades de compra. Te explicamos cada una:
 
-MÉTODO DE PAGO:
-- Únicamente por Llave Breve (Banco Falabella) al número 3057059517
-- El pago se realiza DESPUÉS de que el cliente prueba el servicio
+━━━━━━━━━━━━━━━━
+1️⃣ *CÓDIGO* (Económico)
+━━━━━━━━━━━━━━━━
+🔑 Juego comprado desde Microsoft Xbox
+✅ Se agrega directamente a tu cuenta
+✅ Tuyo de por vida
 
-GARANTÍA:
-- Primero se entrega el servicio para que el cliente lo revise y compruebe que funciona
-- Solo después de que el cliente está satisfecho se realiza el pago
-- Esto garantiza total seguridad y confianza
+━━━━━━━━━━━━━━━━
+2️⃣ *CUENTA PRINCIPAL* (+ Económico)
+━━━━━━━━━━━━━━━━
+🏠 Acceso al juego de por vida
+✅ Juegas desde tu cuenta personal
+✅ Sin necesidad de iniciar sesión en otra cuenta
 
-JUEGOS PARA XBOX:
-- Si un cliente pregunta por un juego específico, búscalo en G2A.com
-- Al precio que encuentres en G2A en pesos colombianos, súmale $25.000 COP y ese es el precio final
-- Dale al cliente el precio final, información del juego y dile que puede adquirirlo contigo
-- Si no encuentras el juego en G2A, dile al cliente que un asesor lo contactará pronto
+━━━━━━━━━━━━━━━━
+3️⃣ *CUENTA SECUNDARIA* (++ Económico)
+━━━━━━━━━━━━━━━━
+👤 Acceso al juego de por vida
+✅ Juegas desde tu cuenta personal
+⚠️ Debes iniciar sesión en la cuenta del juego para jugar
 
-INSTRUCCIONES GENERALES:
-- Si el cliente pregunta por precios de Game Pass, muéstralos todos de forma clara
-- Si el cliente quiere comprar, explícale el proceso paso a paso
-- Si el cliente tiene dudas técnicas sobre Game Pass, Xbox o juegos, ayúdalo
-- No inventes precios ni información que no puedas verificar
-- Sé siempre amable y profesional
-- Si el cliente dice Hola, Buenos días, Buenas o cualquier saludo, responde ÚNICAMENTE con el mensaje de bienvenida predefinido sin agregar nada más"""
+━━━━━━━━━━━━━━━━
+4️⃣ *SECUNDARIA CON MÉTODO* (+++ Económico)
+━━━━━━━━━━━━━━━━
+🔧 Acceso al juego de por vida
+✅ Juegas desde tu cuenta personal
+📋 Siguiendo un tutorial que te compartimos
+
+━━━━━━━━━━━━━━━━
+
+¿Qué juego te interesa? Dinos el nombre y te damos el precio 🎮"""
+
+SOPORTE = """🛠️ *SOPORTE* 🛠️
+
+Para resolver tu solicitud, un asesor te atenderá personalmente.
+
+📲 Escríbenos directamente al:
+👉 *+57 322 908 2927*
+
+¡Estamos para ayudarte! 😊"""
+
+SYSTEM_PROMPT = """Eres un asistente virtual de Game Line Col, una tienda colombiana especializada en Game Pass y juegos para Xbox.
+
+Tu nombre es GameBot. Responde siempre en español, de forma amable y profesional.
+
+INSTRUCCIONES IMPORTANTES:
+- NUNCA repitas el mensaje de bienvenida, ese solo se envía una vez al inicio
+- Siempre que termines una respuesta muestra el menú de opciones
+- Si el cliente escribe 1 o "game pass" muestra la información de Game Pass
+- Si el cliente escribe 2 o "juegos" muestra las opciones de juegos
+- Si el cliente escribe 3 o "soporte" dile que escriba al +57 322 908 2927
+- Si el cliente pregunta por un juego específico, búscalo en G2A.com, toma el precio en pesos colombianos, súmale $25.000 COP y ese es el precio final
+- Si el cliente dice SÍ después de ver Game Pass, dile que siga los pasos en su consola y envíe el código
+- No inventes precios ni información
+- Si no puedes resolver algo termina tu respuesta con: ALERTA_ASESOR"""
 
 conversaciones = {}
 
@@ -96,24 +144,52 @@ def webhook():
     try:
         message = data["entry"][0]["changes"][0]["value"]["messages"][0]
         phone = message["from"]
-        text = message["text"]["body"].strip().lower()
+        text = message["text"]["body"].strip()
+        text_lower = text.lower()
 
-        saludos = ["hola", "buenas", "buenos días", "buenas tardes", "buenas noches", "hi", "hello", "buen día"]
-        es_saludo = any(saludo in text for saludo in saludos)
+        # Saludo o primer mensaje
+        saludos = ["hola", "buenas", "buenos días", "buenas tardes", "buenas noches", "hi", "hello", "buen día", "inicio"]
+        es_saludo = any(saludo in text_lower for saludo in saludos)
 
         if phone not in conversaciones or es_saludo:
-            conversaciones[phone] = True
+            conversaciones[phone] = {"activo": True}
             send_message(phone, BIENVENIDA)
-        else:
-            response = client.models.generate_content(
-                model="gemini-2.5-flash-lite",
-                contents=f"{SYSTEM_PROMPT}\n\nCliente dice: {text}",
-                config=types.GenerateContentConfig(
-                    tools=[types.Tool(google_search=types.GoogleSearch())]
-                )
+            return jsonify({"status": "ok"}), 200
+
+        # Opciones del menú
+        if text == "1" or "game pass" in text_lower:
+            send_message(phone, GAMEPASS)
+            send_message(phone, MENU)
+            return jsonify({"status": "ok"}), 200
+
+        if text == "2" or ("juego" in text_lower and len(text_lower) < 10):
+            send_message(phone, JUEGOS)
+            send_message(phone, MENU)
+            return jsonify({"status": "ok"}), 200
+
+        if text == "3" or "soporte" in text_lower:
+            send_message(phone, SOPORTE)
+            alerta = f"🚨 *ALERTA Game Line Col* 🚨\n\nEl cliente *+{phone}* solicitó soporte."
+            send_message(ADMIN_PHONE, alerta)
+            return jsonify({"status": "ok"}), 200
+
+        # Respuesta con IA para preguntas específicas
+        response = client.models.generate_content(
+            model="gemini-2.5-flash-lite",
+            contents=f"{SYSTEM_PROMPT}\n\nCliente dice: {text}",
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())]
             )
-            reply = response.text
-            send_message(phone, reply)
+        )
+        reply = response.text
+
+        if "ALERTA_ASESOR" in reply:
+            reply = reply.replace("ALERTA_ASESOR", "").strip()
+            alerta = f"🚨 *ALERTA Game Line Col* 🚨\n\nEl cliente *+{phone}* necesita un asesor.\n\n💬 Su pregunta:\n_{text}_"
+            send_message(ADMIN_PHONE, alerta)
+
+        send_message(phone, reply)
+        send_message(phone, MENU)
 
     except Exception as e:
         print(f"Error: {e}")
