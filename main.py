@@ -2,6 +2,8 @@ import os
 import re
 import json
 import requests
+import threading
+import time
 from datetime import datetime
 from flask import Flask, request, jsonify
 from google import genai
@@ -18,6 +20,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS")
 SHEET_ID = "1lvIlK1LYbT68HsuDTbMRzWSYh_RGUPHAZeV31_sAmdU"
 ADMIN_PHONE = "573229082927"
+HORA_SEGUIMIENTO = 3600  # 1 hora en segundos
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -42,6 +45,46 @@ def registrar_cliente(phone, mensaje, servicio, estado):
         ).execute()
     except Exception as e:
         print(f"Error registrando en Sheets: {e}")
+
+def send_message(phone, message):
+    url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": phone,
+        "type": "text",
+        "text": {"body": message}
+    }
+    requests.post(url, headers=headers, json=payload)
+
+def verificar_seguimientos():
+    while True:
+        time.sleep(60)
+        ahora = time.time()
+        for phone, datos in list(conversaciones.items()):
+            if datos.get("compro"):
+                continue
+            ultima = datos.get("ultima_interaccion", 0)
+            recordatorio_enviado = datos.get("recordatorio_enviado", False)
+            if not recordatorio_enviado and (ahora - ultima) >= HORA_SEGUIMIENTO:
+                mensaje = f"""👋 ¡Hola! Te escribimos desde *Game Line Col* 🎮
+
+Notamos que estuviste interesado en nuestros servicios pero no completaste tu compra.
+
+¿Podemos ayudarte con algo? 😊
+
+1️⃣ *Game Pass Ultimate* (Xbox y PC)
+2️⃣ *Juegos Xbox*
+3️⃣ *Soporte*
+
+¡Estamos aquí para ayudarte! 🚀"""
+                send_message(phone, mensaje)
+                conversaciones[phone]["recordatorio_enviado"] = True
+                registrar_cliente(phone, "Recordatorio automático", "Seguimiento", "Recordatorio enviado 🔔")
+                print(f"Recordatorio enviado a +{phone}")
 
 BIENVENIDA = """🎮 ¡Bienvenido a *Game Line Col*! 🎮
 
@@ -151,6 +194,9 @@ INSTRUCCIONES:
 
 conversaciones = {}
 
+# Iniciar hilo de seguimiento
+threading.Thread(target=verificar_seguimientos, daemon=True).start()
+
 @app.route("/webhook", methods=["GET"])
 def verify():
     token = request.args.get("hub.verify_token")
@@ -175,11 +221,17 @@ def webhook():
             conversaciones[phone] = {
                 "activo": True,
                 "estado": "menu",
-                "historial": []
+                "historial": [],
+                "ultima_interaccion": time.time(),
+                "recordatorio_enviado": False,
+                "compro": False
             }
             send_message(phone, BIENVENIDA)
             registrar_cliente(phone, text, "Inicio", "Bienvenida enviada")
             return jsonify({"status": "ok"}), 200
+
+        conversaciones[phone]["ultima_interaccion"] = time.time()
+        conversaciones[phone]["recordatorio_enviado"] = False
 
         estado = conversaciones[phone].get("estado", "menu")
         historial = conversaciones[phone].get("historial", [])
@@ -212,6 +264,7 @@ def webhook():
 
         if estado == "gamepass" and text_lower in ["si", "sí", "yes", "quiero", "dale", "listo"]:
             conversaciones[phone]["estado"] = "activacion"
+            conversaciones[phone]["compro"] = True
             historial.append({"role": "user", "content": text})
             historial.append({"role": "assistant", "content": ACTIVACION})
             conversaciones[phone]["historial"] = historial
@@ -241,6 +294,7 @@ def webhook():
             match = re.search(r'ALERTA_JUEGO:([^\n]+)', reply)
             nombre_juego = match.group(1).strip() if match else text
             reply = re.sub(r'ALERTA_JUEGO:[^\n]+', '', reply).strip()
+            conversaciones[phone]["compro"] = True
             registrar_cliente(phone, text, f"Juego: {nombre_juego}", "Cotización solicitada 🎮")
             alerta = f"🎮 *COTIZACIÓN DE JUEGO - Game Line Col* 🎮\n\nEl cliente *+{phone}* busca:\n👉 *{nombre_juego}*\n\nPor favor cotiza y respóndele."
             send_message(ADMIN_PHONE, alerta)
@@ -262,20 +316,6 @@ def webhook():
     except Exception as e:
         print(f"Error: {e}")
     return jsonify({"status": "ok"}), 200
-
-def send_message(phone, message):
-    url = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": phone,
-        "type": "text",
-        "text": {"body": message}
-    }
-    requests.post(url, headers=headers, json=payload)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
