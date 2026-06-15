@@ -141,6 +141,7 @@ CONTEXTO DEL NEGOCIO:
 - No tenemos catálogo de juegos, cotizamos según lo que pida el cliente
 
 INSTRUCCIONES:
+- Usa el historial de conversación para dar respuestas coherentes y contextuales
 - Responde SOLO lo que el cliente está preguntando, sin repetir menús ni opciones ya mostradas
 - Si el cliente pregunta por un juego específico, dile que lo vas a cotizar y termina con ALERTA_JUEGO:[nombre del juego]
 - Si el cliente tiene una duda técnica sobre Xbox o Game Pass, resuélvela directamente
@@ -171,21 +172,32 @@ def webhook():
         es_saludo = any(saludo in text_lower for saludo in saludos)
 
         if phone not in conversaciones or es_saludo:
-            conversaciones[phone] = {"activo": True, "estado": "menu"}
+            conversaciones[phone] = {
+                "activo": True,
+                "estado": "menu",
+                "historial": []
+            }
             send_message(phone, BIENVENIDA)
             registrar_cliente(phone, text, "Inicio", "Bienvenida enviada")
             return jsonify({"status": "ok"}), 200
 
         estado = conversaciones[phone].get("estado", "menu")
+        historial = conversaciones[phone].get("historial", [])
 
         if text == "1" or "game pass" in text_lower:
             conversaciones[phone]["estado"] = "gamepass"
+            historial.append({"role": "user", "content": text})
+            historial.append({"role": "assistant", "content": GAMEPASS})
+            conversaciones[phone]["historial"] = historial
             send_message(phone, GAMEPASS)
             registrar_cliente(phone, text, "Game Pass Ultimate", "Consultó precios")
             return jsonify({"status": "ok"}), 200
 
         if text == "2" or text_lower in ["juegos", "juego", "juegos xbox"]:
             conversaciones[phone]["estado"] = "juegos"
+            historial.append({"role": "user", "content": text})
+            historial.append({"role": "assistant", "content": JUEGOS_MENU})
+            conversaciones[phone]["historial"] = historial
             send_message(phone, JUEGOS_MENU)
             registrar_cliente(phone, text, "Juegos Xbox", "Consultó juegos")
             return jsonify({"status": "ok"}), 200
@@ -200,15 +212,25 @@ def webhook():
 
         if estado == "gamepass" and text_lower in ["si", "sí", "yes", "quiero", "dale", "listo"]:
             conversaciones[phone]["estado"] = "activacion"
+            historial.append({"role": "user", "content": text})
+            historial.append({"role": "assistant", "content": ACTIVACION})
+            conversaciones[phone]["historial"] = historial
             send_message(phone, ACTIVACION)
             registrar_cliente(phone, text, "Game Pass Ultimate", "Quiere contratar ✅")
             alerta = f"🎮 *NUEVO CLIENTE - Game Line Col* 🎮\n\nEl cliente *+{phone}* quiere contratar Game Pass Ultimate.\n\n¡Espera su código de activación! 🚀"
             send_message(ADMIN_PHONE, alerta)
             return jsonify({"status": "ok"}), 200
 
+        historial.append({"role": "user", "content": text})
+
+        historial_texto = "\n".join([
+            f"{'Cliente' if h['role'] == 'user' else 'GameBot'}: {h['content']}"
+            for h in historial[-10:]
+        ])
+
         response = client.models.generate_content(
             model="gemini-2.5-flash-lite",
-            contents=f"{SYSTEM_PROMPT}\n\nEstado actual del cliente: {estado}\n\nCliente dice: {text}",
+            contents=f"{SYSTEM_PROMPT}\n\nHistorial de conversación:\n{historial_texto}\n\nResponde al último mensaje del cliente.",
             config=types.GenerateContentConfig(
                 tools=[types.Tool(google_search=types.GoogleSearch())]
             )
@@ -231,6 +253,9 @@ def webhook():
 
         else:
             registrar_cliente(phone, text, "Consulta general", "Respondido por bot ✅")
+
+        historial.append({"role": "assistant", "content": reply})
+        conversaciones[phone]["historial"] = historial[-20:]
 
         send_message(phone, reply)
 
