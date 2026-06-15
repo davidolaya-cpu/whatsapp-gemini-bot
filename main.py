@@ -59,18 +59,18 @@ El precio es el mismo en ambas modalidades.
 ━━━━━━━━━━━━━━━━
 Llave Breve Falabella al *3057059517*
 
-━━━━━━━━━━━━━━━━
-📲 *¿CÓMO ACTIVARLO?*
-━━━━━━━━━━━━━━━━
-Sigue estos pasos en tu consola:
+¿Te gustaría contratar el servicio? Responde *SÍ* para continuar 😊"""
+
+ACTIVACION = """✅ ¡Perfecto! Sigue estos pasos en tu consola para activar el servicio:
 
 1️⃣ Ve a *"Agregar nuevo"* (como si fueras a agregar una nueva cuenta)
 2️⃣ Selecciona *"Usar otro dispositivo"*
-3️⃣ Aparecerá un código alfanumérico, cópialo y *envíalo al número: +57 322 908 2927* 📩
+3️⃣ Aparecerá un *código alfanumérico*, cópialo
 
-Un asesor activará tu servicio de inmediato 🚀
+📲 Luego envía ese código directamente a nuestro asesor al:
+👉 *+57 322 908 2927*
 
-¿Te gustaría contratar el servicio? Responde con el tiempo que deseas 😊"""
+¡El asesor activará tu servicio de inmediato! 🚀"""
 
 JUEGOS_MENU = """🎮 *JUEGOS XBOX* 🎮
 
@@ -143,27 +143,42 @@ def webhook():
         es_saludo = any(saludo in text_lower for saludo in saludos)
 
         if phone not in conversaciones or es_saludo:
-            conversaciones[phone] = {"activo": True}
+            conversaciones[phone] = {"activo": True, "estado": "menu"}
             send_message(phone, BIENVENIDA)
             return jsonify({"status": "ok"}), 200
 
+        estado = conversaciones[phone].get("estado", "menu")
+
+        # Opciones del menú principal
         if text == "1" or "game pass" in text_lower:
+            conversaciones[phone]["estado"] = "gamepass"
             send_message(phone, GAMEPASS)
             return jsonify({"status": "ok"}), 200
 
-        if text == "2" or (text_lower in ["juegos", "juego", "juegos xbox"]):
+        if text == "2" or text_lower in ["juegos", "juego", "juegos xbox"]:
+            conversaciones[phone]["estado"] = "juegos"
             send_message(phone, JUEGOS_MENU)
             return jsonify({"status": "ok"}), 200
 
         if text == "3" or "soporte" in text_lower:
+            conversaciones[phone]["estado"] = "soporte"
             send_message(phone, SOPORTE)
             alerta = f"🚨 *SOPORTE Game Line Col* 🚨\n\nEl cliente *+{phone}* solicitó soporte."
             send_message(ADMIN_PHONE, alerta)
             return jsonify({"status": "ok"}), 200
 
+        # Cliente dice SÍ para contratar Game Pass
+        if estado == "gamepass" and text_lower in ["si", "sí", "yes", "quiero", "dale", "listo"]:
+            conversaciones[phone]["estado"] = "activacion"
+            send_message(phone, ACTIVACION)
+            alerta = f"🎮 *NUEVO CLIENTE - Game Line Col* 🎮\n\nEl cliente *+{phone}* quiere contratar Game Pass Ultimate.\n\n¡Espera su código de activación! 🚀"
+            send_message(ADMIN_PHONE, alerta)
+            return jsonify({"status": "ok"}), 200
+
+        # Respuesta con IA para todo lo demás
         response = client.models.generate_content(
             model="gemini-2.5-flash-lite",
-            contents=f"{SYSTEM_PROMPT}\n\nCliente dice: {text}",
+            contents=f"{SYSTEM_PROMPT}\n\nEstado actual del cliente: {estado}\n\nCliente dice: {text}",
             config=types.GenerateContentConfig(
                 tools=[types.Tool(google_search=types.GoogleSearch())]
             )
