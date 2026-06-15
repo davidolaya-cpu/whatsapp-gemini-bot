@@ -27,7 +27,7 @@ def webhook():
         message = data["entry"][0]["changes"][0]["value"]["messages"][0]
         phone = message["from"]
         text = message["text"]["body"]
-        response = client.models.generate_content(model="gemini-2.0-flash", contents=text)
+        response = client.models.generate_content(model="gemini-1.5-flash", contents=text)
         reply = response.text
         send_message(phone, reply)
     except Exception as e:
