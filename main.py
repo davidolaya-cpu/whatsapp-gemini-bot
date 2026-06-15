@@ -64,6 +64,20 @@ def es_codigo_activacion(texto):
     texto = texto.strip()
     return bool(re.match(r'^[A-Za-z0-9]{6,12}$', texto))
 
+def extraer_meses(texto):
+    texto = texto.lower()
+    meses_map = {
+        "1": "1 mes", "un mes": "1 mes", "uno": "1 mes",
+        "2": "2 meses", "dos": "2 meses",
+        "3": "3 meses", "tres": "3 meses",
+        "6": "6 meses", "seis": "6 meses",
+        "12": "12 meses", "doce": "12 meses", "un año": "12 meses", "un ano": "12 meses"
+    }
+    for key, value in meses_map.items():
+        if key in texto:
+            return value
+    return None
+
 def verificar_seguimientos():
     while True:
         time.sleep(60)
@@ -134,6 +148,16 @@ El precio es el mismo en ambas modalidades.
 Llave Breve Falabella al *3057059517*
 
 ¿Te gustaría contratar el servicio? Responde *SÍ* para continuar 😊"""
+
+PREGUNTAR_MESES = """⏳ ¡Perfecto! ¿Por cuántos meses deseas contratar el servicio?
+
+📅 1 mes → $29.900
+📅 2 meses → $55.000
+📅 3 meses → $80.000
+📅 6 meses → $140.000
+📅 12 meses → $190.000
+
+Responde con el número de meses 😊"""
 
 ACTIVACION = """✅ ¡Perfecto! Sigue estos pasos en tu consola para activar el servicio:
 
@@ -232,7 +256,8 @@ def webhook():
                 "historial": [],
                 "ultima_interaccion": time.time(),
                 "recordatorio_enviado": False,
-                "compro": False
+                "compro": False,
+                "meses_seleccionados": None
             }
             send_message(phone, BIENVENIDA)
             registrar_cliente(phone, text, "Inicio", "Bienvenida enviada")
@@ -244,12 +269,14 @@ def webhook():
         estado = conversaciones[phone].get("estado", "menu")
         historial = conversaciones[phone].get("historial", [])
 
-        if estado == "activacion" and es_codigo_activacion(text):
+        # Detectar código de activación
+        if es_codigo_activacion(text) and not conversaciones[phone].get("compro") and estado == "activacion":
+            meses = conversaciones[phone].get("meses_seleccionados", "No especificado")
             conversaciones[phone]["compro"] = True
             send_message(phone, "✅ ¡Código recibido! Nuestro asesor lo activará en breve. ¡Gracias por tu compra! 🎮")
-            alerta = f"🎮 *CÓDIGO DE ACTIVACIÓN - Game Line Col* 🎮\n\nCliente: *+{phone}*\nCódigo: *{text}*\n\n¡Activa el servicio! 🚀"
+            alerta = f"🎮 *CÓDIGO DE ACTIVACIÓN - Game Line Col* 🎮\n\nCliente: *+{phone}*\n⏳ Meses contratados: *{meses}*\n🔑 Código: *{text}*\n\n¡Activa el servicio! 🚀"
             send_message(ADMIN_PHONE, alerta)
-            registrar_cliente(phone, text, "Game Pass Ultimate", "💰 COMPRA CONFIRMADA - Código recibido")
+            registrar_cliente(phone, f"Código: {text}", f"Game Pass - {meses}", "💰 COMPRA CONFIRMADA")
             return jsonify({"status": "ok"}), 200
 
         if text == "1" or "game pass" in text_lower:
@@ -278,16 +305,29 @@ def webhook():
             send_message(ADMIN_PHONE, alerta)
             return jsonify({"status": "ok"}), 200
 
+        # Cliente dice SÍ para contratar
         if estado == "gamepass" and text_lower in ["si", "sí", "yes", "quiero", "dale", "listo"]:
-            conversaciones[phone]["estado"] = "activacion"
-            historial.append({"role": "user", "content": text})
-            historial.append({"role": "assistant", "content": ACTIVACION})
-            conversaciones[phone]["historial"] = historial
-            send_message(phone, ACTIVACION)
+            conversaciones[phone]["estado"] = "seleccion_meses"
+            send_message(phone, PREGUNTAR_MESES)
             registrar_cliente(phone, text, "Game Pass Ultimate", "Quiere contratar ✅")
-            alerta = f"🎮 *NUEVO CLIENTE - Game Line Col* 🎮\n\nEl cliente *+{phone}* quiere contratar Game Pass Ultimate.\n\n¡Espera su código de activación! 🚀"
-            send_message(ADMIN_PHONE, alerta)
             return jsonify({"status": "ok"}), 200
+
+        # Cliente elige meses
+        if estado == "seleccion_meses":
+            meses = extraer_meses(text)
+            if meses:
+                conversaciones[phone]["meses_seleccionados"] = meses
+                conversaciones[phone]["estado"] = "activacion"
+                historial.append({"role": "user", "content": text})
+                historial.append({"role": "assistant", "content": ACTIVACION})
+                conversaciones[phone]["historial"] = historial
+                send_message(phone, f"✅ ¡Perfecto! Seleccionaste *{meses}*.\n\n" + ACTIVACION)
+                alerta = f"🎮 *NUEVO CLIENTE - Game Line Col* 🎮\n\nEl cliente *+{phone}* quiere contratar:\n⏳ *{meses}* de Game Pass Ultimate\n\n¡Espera su código de activación! 🚀"
+                send_message(ADMIN_PHONE, alerta)
+                return jsonify({"status": "ok"}), 200
+            else:
+                send_message(phone, "No entendí la cantidad de meses 😊 Por favor responde con un número:\n\n1️⃣ 1 mes\n2️⃣ 2 meses\n3️⃣ 3 meses\n4️⃣ 6 meses\n5️⃣ 12 meses")
+                return jsonify({"status": "ok"}), 200
 
         historial.append({"role": "user", "content": text})
 
