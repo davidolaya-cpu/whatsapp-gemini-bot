@@ -20,7 +20,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS")
 SHEET_ID = "1lvIlK1LYbT68HsuDTbMRzWSYh_RGUPHAZeV31_sAmdU"
 ADMIN_PHONE = "573229082927"
-HORA_SEGUIMIENTO = 3600  # 1 hora en segundos
+HORA_SEGUIMIENTO = 3600
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -60,6 +60,10 @@ def send_message(phone, message):
     }
     requests.post(url, headers=headers, json=payload)
 
+def es_codigo_activacion(texto):
+    texto = texto.strip()
+    return bool(re.match(r'^[A-Za-z0-9]{6,12}$', texto))
+
 def verificar_seguimientos():
     while True:
         time.sleep(60)
@@ -84,7 +88,6 @@ Notamos que estuviste interesado en nuestros servicios pero no completaste tu co
                 send_message(phone, mensaje)
                 conversaciones[phone]["recordatorio_enviado"] = True
                 registrar_cliente(phone, "Recordatorio automático", "Seguimiento", "Recordatorio enviado 🔔")
-                print(f"Recordatorio enviado a +{phone}")
 
 BIENVENIDA = """🎮 ¡Bienvenido a *Game Line Col*! 🎮
 
@@ -136,12 +139,9 @@ ACTIVACION = """✅ ¡Perfecto! Sigue estos pasos en tu consola para activar el 
 
 1️⃣ Ve a *"Agregar nuevo"* (como si fueras a agregar una nueva cuenta)
 2️⃣ Selecciona *"Usar otro dispositivo"*
-3️⃣ Aparecerá un *código alfanumérico*, cópialo
+3️⃣ Aparecerá un *código alfanumérico*, cópialo y *envíalo aquí mismo* 📩
 
-📲 Luego envía ese código directamente a nuestro asesor al:
-👉 *+57 322 908 2927*
-
-¡El asesor activará tu servicio de inmediato! 🚀"""
+¡Nuestro asesor lo activará de inmediato! 🚀"""
 
 JUEGOS_MENU = """🎮 *JUEGOS XBOX* 🎮
 
@@ -180,7 +180,7 @@ CONTEXTO DEL NEGOCIO:
 - Vendemos juegos Xbox en 4 modalidades: Código, Principal, Secundaria, Secundaria con método
 - El pago es por Llave Breve Falabella al 3057059517
 - El cliente primero prueba y luego paga
-- Para activar Game Pass el cliente debe enviar el código alfanumérico al +57 322 908 2927
+- Para activar Game Pass el cliente debe enviar el código alfanumérico en este mismo chat
 - No tenemos catálogo de juegos, cotizamos según lo que pida el cliente
 
 INSTRUCCIONES:
@@ -194,7 +194,6 @@ INSTRUCCIONES:
 
 conversaciones = {}
 
-# Iniciar hilo de seguimiento
 threading.Thread(target=verificar_seguimientos, daemon=True).start()
 
 @app.route("/webhook", methods=["GET"])
@@ -236,6 +235,15 @@ def webhook():
         estado = conversaciones[phone].get("estado", "menu")
         historial = conversaciones[phone].get("historial", [])
 
+        # Detectar código de activación
+        if estado == "activacion" and es_codigo_activacion(text):
+            conversaciones[phone]["compro"] = True
+            send_message(phone, "✅ ¡Código recibido! Nuestro asesor lo activará en breve. ¡Gracias por tu compra! 🎮")
+            alerta = f"🎮 *CÓDIGO DE ACTIVACIÓN - Game Line Col* 🎮\n\nCliente: *+{phone}*\nCódigo: *{text}*\n\n¡Activa el servicio! 🚀"
+            send_message(ADMIN_PHONE, alerta)
+            registrar_cliente(phone, text, "Game Pass Ultimate", "Código enviado ✅ - Compra confirmada")
+            return jsonify({"status": "ok"}), 200
+
         if text == "1" or "game pass" in text_lower:
             conversaciones[phone]["estado"] = "gamepass"
             historial.append({"role": "user", "content": text})
@@ -264,7 +272,6 @@ def webhook():
 
         if estado == "gamepass" and text_lower in ["si", "sí", "yes", "quiero", "dale", "listo"]:
             conversaciones[phone]["estado"] = "activacion"
-            conversaciones[phone]["compro"] = True
             historial.append({"role": "user", "content": text})
             historial.append({"role": "assistant", "content": ACTIVACION})
             conversaciones[phone]["historial"] = historial
