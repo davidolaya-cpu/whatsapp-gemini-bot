@@ -27,12 +27,6 @@ Somos tu tienda de confianza para juegos y suscripciones Xbox 🕹️
 
 Responde con el número de tu opción 😊"""
 
-MENU = """¿En qué más te puedo ayudar? 😊
-
-1️⃣ *Game Pass Ultimate* (Xbox y PC)
-2️⃣ *Juegos Xbox*
-3️⃣ *Soporte*"""
-
 GAMEPASS = """🕹️ *GAME PASS ULTIMATE - Xbox y PC* 🕹️
 
 Con Game Pass Ultimate tienes acceso a cientos de juegos en Xbox y PC.
@@ -45,6 +39,14 @@ Con Game Pass Ultimate tienes acceso a cientos de juegos en Xbox y PC.
 📅 3 meses → $80.000
 📅 6 meses → $140.000
 📅 12 meses → $190.000
+
+━━━━━━━━━━━━━━━━
+🎯 *MODALIDADES*
+━━━━━━━━━━━━━━━━
+🏠 *Cuenta Principal:* Juegas desde tu cuenta personal sin iniciar sesión en otra cuenta
+👤 *Cuenta Secundaria:* Juegas desde tu cuenta personal iniciando sesión en la cuenta del servicio
+
+El precio es el mismo en ambas modalidades.
 
 ━━━━━━━━━━━━━━━━
 🛡️ *GARANTÍA*
@@ -64,69 +66,59 @@ Sigue estos pasos en tu consola:
 
 1️⃣ Ve a *"Agregar nuevo"* (como si fueras a agregar una nueva cuenta)
 2️⃣ Selecciona *"Usar otro dispositivo"*
-3️⃣ Copia el código alfanumérico que aparece y *envíalo aquí* 📩
+3️⃣ Aparecerá un código alfanumérico, cópialo y *envíalo al número: +57 322 908 2927* 📩
 
-¿Te gustaría contratar el servicio? Responde *SÍ* y envíanos el código 🎮"""
+Un asesor activará tu servicio de inmediato 🚀
 
-JUEGOS = """🎮 *JUEGOS XBOX* 🎮
+¿Te gustaría contratar el servicio? Responde con el tiempo que deseas 😊"""
 
-Tenemos 4 modalidades de compra. Te explicamos cada una:
+JUEGOS_MENU = """🎮 *JUEGOS XBOX* 🎮
 
-━━━━━━━━━━━━━━━━
+Tenemos 4 modalidades de compra:
+
 1️⃣ *CÓDIGO* (Económico)
-━━━━━━━━━━━━━━━━
-🔑 Juego comprado desde Microsoft Xbox
-✅ Se agrega directamente a tu cuenta
-✅ Tuyo de por vida
+🔑 Juego comprado desde Microsoft, se agrega directamente a tu cuenta de por vida
 
-━━━━━━━━━━━━━━━━
 2️⃣ *CUENTA PRINCIPAL* (+ Económico)
-━━━━━━━━━━━━━━━━
-🏠 Acceso al juego de por vida
-✅ Juegas desde tu cuenta personal
-✅ Sin necesidad de iniciar sesión en otra cuenta
+🏠 Acceso de por vida, juegas desde tu cuenta sin iniciar sesión en otra
 
-━━━━━━━━━━━━━━━━
 3️⃣ *CUENTA SECUNDARIA* (++ Económico)
-━━━━━━━━━━━━━━━━
-👤 Acceso al juego de por vida
-✅ Juegas desde tu cuenta personal
-⚠️ Debes iniciar sesión en la cuenta del juego para jugar
+👤 Acceso de por vida, juegas desde tu cuenta iniciando sesión en la cuenta del juego
 
-━━━━━━━━━━━━━━━━
 4️⃣ *SECUNDARIA CON MÉTODO* (+++ Económico)
-━━━━━━━━━━━━━━━━
-🔧 Acceso al juego de por vida
-✅ Juegas desde tu cuenta personal
-📋 Siguiendo un tutorial que te compartimos
+🔧 Acceso de por vida siguiendo un tutorial que te compartimos
 
 ━━━━━━━━━━━━━━━━
-
-¿Qué juego te interesa? Dinos el nombre y te damos el precio 🎮"""
+¿Qué juego estás buscando? 🎮 *Dinos el nombre* y te conseguimos el precio 👇"""
 
 SOPORTE = """🛠️ *SOPORTE* 🛠️
 
-Para resolver tu solicitud, un asesor te atenderá personalmente.
+Un asesor te atenderá personalmente para resolver tu solicitud.
 
 📲 Escríbenos directamente al:
 👉 *+57 322 908 2927*
 
 ¡Estamos para ayudarte! 😊"""
 
-SYSTEM_PROMPT = """Eres un asistente virtual de Game Line Col, una tienda colombiana especializada en Game Pass y juegos para Xbox.
+SYSTEM_PROMPT = """Eres un asistente virtual de Game Line Col, una tienda colombiana especializada en Game Pass Ultimate y juegos para Xbox.
 
-Tu nombre es GameBot. Responde siempre en español, de forma amable y profesional.
+Tu nombre es GameBot. Responde siempre en español, de forma amable y profesional. Usa emojis ocasionalmente 🎮
 
-INSTRUCCIONES IMPORTANTES:
-- NUNCA repitas el mensaje de bienvenida, ese solo se envía una vez al inicio
-- Siempre que termines una respuesta muestra el menú de opciones
-- Si el cliente escribe 1 o "game pass" muestra la información de Game Pass
-- Si el cliente escribe 2 o "juegos" muestra las opciones de juegos
-- Si el cliente escribe 3 o "soporte" dile que escriba al +57 322 908 2927
-- Si el cliente pregunta por un juego específico, búscalo en G2A.com, toma el precio en pesos colombianos, súmale $25.000 COP y ese es el precio final
-- Si el cliente dice SÍ después de ver Game Pass, dile que siga los pasos en su consola y envíe el código
-- No inventes precios ni información
-- Si no puedes resolver algo termina tu respuesta con: ALERTA_ASESOR"""
+CONTEXTO DEL NEGOCIO:
+- Vendemos Game Pass Ultimate para Xbox y PC
+- Vendemos juegos Xbox en 4 modalidades: Código, Principal, Secundaria, Secundaria con método
+- El pago es por Llave Breve Falabella al 3057059517
+- El cliente primero prueba y luego paga
+- Para activar Game Pass el cliente debe enviar el código alfanumérico al +57 322 908 2927
+- No tenemos catálogo de juegos, cotizamos según lo que pida el cliente
+
+INSTRUCCIONES:
+- Responde SOLO lo que el cliente está preguntando, sin repetir menús ni opciones ya mostradas
+- Si el cliente pregunta por un juego específico, dile que lo vas a cotizar y termina con ALERTA_JUEGO:[nombre del juego]
+- Si el cliente tiene una duda técnica sobre Xbox o Game Pass, resuélvela directamente
+- Si no puedes resolver algo, termina con ALERTA_ASESOR
+- No inventes precios de juegos, siempre deriva al asesor para cotizar
+- Sé conciso y directo"""
 
 conversaciones = {}
 
@@ -147,8 +139,7 @@ def webhook():
         text = message["text"]["body"].strip()
         text_lower = text.lower()
 
-        # Saludo o primer mensaje
-        saludos = ["hola", "buenas", "buenos días", "buenas tardes", "buenas noches", "hi", "hello", "buen día", "inicio"]
+        saludos = ["hola", "buenas", "buenos días", "buenas tardes", "buenas noches", "hi", "hello", "buen día", "inicio", "empezar"]
         es_saludo = any(saludo in text_lower for saludo in saludos)
 
         if phone not in conversaciones or es_saludo:
@@ -156,24 +147,20 @@ def webhook():
             send_message(phone, BIENVENIDA)
             return jsonify({"status": "ok"}), 200
 
-        # Opciones del menú
         if text == "1" or "game pass" in text_lower:
             send_message(phone, GAMEPASS)
-            send_message(phone, MENU)
             return jsonify({"status": "ok"}), 200
 
-        if text == "2" or ("juego" in text_lower and len(text_lower) < 10):
-            send_message(phone, JUEGOS)
-            send_message(phone, MENU)
+        if text == "2" or (text_lower in ["juegos", "juego", "juegos xbox"]):
+            send_message(phone, JUEGOS_MENU)
             return jsonify({"status": "ok"}), 200
 
         if text == "3" or "soporte" in text_lower:
             send_message(phone, SOPORTE)
-            alerta = f"🚨 *ALERTA Game Line Col* 🚨\n\nEl cliente *+{phone}* solicitó soporte."
+            alerta = f"🚨 *SOPORTE Game Line Col* 🚨\n\nEl cliente *+{phone}* solicitó soporte."
             send_message(ADMIN_PHONE, alerta)
             return jsonify({"status": "ok"}), 200
 
-        # Respuesta con IA para preguntas específicas
         response = client.models.generate_content(
             model="gemini-2.5-flash-lite",
             contents=f"{SYSTEM_PROMPT}\n\nCliente dice: {text}",
@@ -183,13 +170,20 @@ def webhook():
         )
         reply = response.text
 
-        if "ALERTA_ASESOR" in reply:
+        if "ALERTA_JUEGO:" in reply:
+            import re
+            match = re.search(r'ALERTA_JUEGO:([^\n]+)', reply)
+            nombre_juego = match.group(1).strip() if match else text
+            reply = re.sub(r'ALERTA_JUEGO:[^\n]+', '', reply).strip()
+            alerta = f"🎮 *COTIZACIÓN DE JUEGO - Game Line Col* 🎮\n\nEl cliente *+{phone}* busca:\n👉 *{nombre_juego}*\n\nPor favor cotiza y respóndele."
+            send_message(ADMIN_PHONE, alerta)
+
+        elif "ALERTA_ASESOR" in reply:
             reply = reply.replace("ALERTA_ASESOR", "").strip()
             alerta = f"🚨 *ALERTA Game Line Col* 🚨\n\nEl cliente *+{phone}* necesita un asesor.\n\n💬 Su pregunta:\n_{text}_"
             send_message(ADMIN_PHONE, alerta)
 
         send_message(phone, reply)
-        send_message(phone, MENU)
 
     except Exception as e:
         print(f"Error: {e}")
