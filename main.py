@@ -74,7 +74,7 @@ def verificar_seguimientos():
             ultima = datos.get("ultima_interaccion", 0)
             recordatorio_enviado = datos.get("recordatorio_enviado", False)
             if not recordatorio_enviado and (ahora - ultima) >= HORA_SEGUIMIENTO:
-                mensaje = f"""👋 ¡Hola! Te escribimos desde *Game Line Col* 🎮
+                mensaje = """👋 ¡Hola! Te escribimos desde *Game Line Col* 🎮
 
 Notamos que estuviste interesado en nuestros servicios pero no completaste tu compra.
 
@@ -208,7 +208,16 @@ def verify():
 def webhook():
     data = request.json
     try:
-        message = data["entry"][0]["changes"][0]["value"]["messages"][0]
+        value = data["entry"][0]["changes"][0]["value"]
+
+        if "messages" not in value:
+            return jsonify({"status": "ok"}), 200
+
+        message = value["messages"][0]
+
+        if message.get("type") != "text":
+            return jsonify({"status": "ok"}), 200
+
         phone = message["from"]
         text = message["text"]["body"].strip()
         text_lower = text.lower()
@@ -235,13 +244,12 @@ def webhook():
         estado = conversaciones[phone].get("estado", "menu")
         historial = conversaciones[phone].get("historial", [])
 
-        # Detectar código de activación
         if estado == "activacion" and es_codigo_activacion(text):
             conversaciones[phone]["compro"] = True
             send_message(phone, "✅ ¡Código recibido! Nuestro asesor lo activará en breve. ¡Gracias por tu compra! 🎮")
             alerta = f"🎮 *CÓDIGO DE ACTIVACIÓN - Game Line Col* 🎮\n\nCliente: *+{phone}*\nCódigo: *{text}*\n\n¡Activa el servicio! 🚀"
             send_message(ADMIN_PHONE, alerta)
-            registrar_cliente(phone, text, "Game Pass Ultimate", "Código enviado ✅ - Compra confirmada")
+            registrar_cliente(phone, text, "Game Pass Ultimate", "💰 COMPRA CONFIRMADA - Código recibido")
             return jsonify({"status": "ok"}), 200
 
         if text == "1" or "game pass" in text_lower:
@@ -302,13 +310,13 @@ def webhook():
             nombre_juego = match.group(1).strip() if match else text
             reply = re.sub(r'ALERTA_JUEGO:[^\n]+', '', reply).strip()
             conversaciones[phone]["compro"] = True
-            registrar_cliente(phone, text, f"Juego: {nombre_juego}", "Cotización solicitada 🎮")
+            registrar_cliente(phone, text, f"Juego: {nombre_juego}", "🎮 Cotización solicitada")
             alerta = f"🎮 *COTIZACIÓN DE JUEGO - Game Line Col* 🎮\n\nEl cliente *+{phone}* busca:\n👉 *{nombre_juego}*\n\nPor favor cotiza y respóndele."
             send_message(ADMIN_PHONE, alerta)
 
         elif "ALERTA_ASESOR" in reply:
             reply = reply.replace("ALERTA_ASESOR", "").strip()
-            registrar_cliente(phone, text, "Consulta general", "Necesita asesor 🚨")
+            registrar_cliente(phone, text, "Consulta general", "🚨 Necesita asesor")
             alerta = f"🚨 *ALERTA Game Line Col* 🚨\n\nEl cliente *+{phone}* necesita un asesor.\n\n💬 Su pregunta:\n_{text}_"
             send_message(ADMIN_PHONE, alerta)
 
