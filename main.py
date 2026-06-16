@@ -467,10 +467,11 @@ def webhook():
         )
         reply = response.text
 
-        if "ALERTA_JUEGO:" in reply:
-            match = re.search(r'ALERTA_JUEGO:([^\n]+)', reply)
-            nombre_juego = match.group(1).strip() if match else text
-            reply = re.sub(r'ALERTA_JUEGO:[^\n]+', '', reply).strip()
-            conversaciones[phone]["compro"] = True
-            registrar_cliente(phone, text, f"Juego: {nombre_juego}", "🎮 Cotización solicitada")
-            alerta = f"🎮 *COTIZACIÓN DE JUEGO 
+         if "ALERTA_JUEGO:" in reply:
+    match = re.search(r'ALERTA_JUEGO:([^\n]+)', reply)
+    nombre_juego = match.group(1).strip() if match else text
+    reply = re.sub(r'ALERTA_JUEGO:[^\n]+', '', reply).strip()
+    conversaciones[phone]["compro"] = True
+    registrar_cliente(phone, text, f"Juego: {nombre_juego}", "Cotizacion solicitada")
+    alerta = "Juego solicitado por cliente +" + phone + ": " + nombre_juego
+    send_message(ADMIN_PHONE, alerta)
