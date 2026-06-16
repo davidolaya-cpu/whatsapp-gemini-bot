@@ -60,21 +60,23 @@ def send_message(phone, message):
     }
     requests.post(url, headers=headers, json=payload)
 
-def es_codigo_activacion(texto):
+def es_codigo_consola(texto):
     texto = texto.strip()
-    return bool(re.match(r'^[A-Za-z0-9]{6,12}$', texto))
+    # Códigos de consola Xbox: letras y números, entre 6 y 25 caracteres
+    return bool(re.match(r'^[A-Za-z0-9]{6,25}$', texto))
 
 def extraer_meses(texto):
-    texto = texto.lower()
+    texto = texto.lower().strip()
     meses_map = {
         "1": "1 mes", "un mes": "1 mes", "uno": "1 mes",
-        "2": "2 meses", "dos": "2 meses",
-        "3": "3 meses", "tres": "3 meses",
-        "6": "6 meses", "seis": "6 meses",
-        "12": "12 meses", "doce": "12 meses", "un año": "12 meses", "un ano": "12 meses"
+        "2": "2 meses", "dos meses": "2 meses", "dos": "2 meses",
+        "3": "3 meses", "tres meses": "3 meses", "tres": "3 meses",
+        "6": "6 meses", "seis meses": "6 meses", "seis": "6 meses",
+        "12": "12 meses", "doce meses": "12 meses", "doce": "12 meses",
+        "un año": "12 meses", "un ano": "12 meses"
     }
     for key, value in meses_map.items():
-        if key in texto:
+        if texto == key or key in texto:
             return value
     return None
 
@@ -151,21 +153,38 @@ Llave Breve Falabella al *3057059517*
 
 PREGUNTAR_MESES = """⏳ ¡Perfecto! ¿Por cuántos meses deseas contratar el servicio?
 
-📅 1 mes → $29.900
-📅 2 meses → $55.000
-📅 3 meses → $80.000
-📅 6 meses → $140.000
-📅 12 meses → $190.000
+📅 *1 mes* → $29.900
+📅 *2 meses* → $55.000
+📅 *3 meses* → $80.000
+📅 *6 meses* → $140.000
+📅 *12 meses* → $190.000
 
 Responde con el número de meses 😊"""
 
-ACTIVACION = """✅ ¡Perfecto! Sigue estos pasos en tu consola para activar el servicio:
+PREGUNTAR_CONSOLA = """✅ ¡Perfecto! ¿Tienes tu consola o PC disponible en este momento para generar el código de activación?
+
+1️⃣ *Sí, tengo mi consola/PC disponible*
+2️⃣ *No, quiero apartar el servicio y activarlo después*"""
+
+ACTIVACION = """📲 Sigue estos pasos en tu consola o PC:
 
 1️⃣ Ve a *"Agregar nuevo"* (como si fueras a agregar una nueva cuenta)
 2️⃣ Selecciona *"Usar otro dispositivo"*
-3️⃣ Aparecerá un *código alfanumérico*, cópialo y *envíalo aquí mismo* 📩
+3️⃣ Aparecerá un *código*, cópialo y *envíalo aquí mismo* 📩
 
 ¡Nuestro asesor lo activará de inmediato! 🚀"""
+
+APARTAR_SERVICIO = """💳 ¡Sin problema! Puedes apartar tu servicio pagando ahora y activarlo cuando tengas tu consola disponible.
+
+━━━━━━━━━━━━━━━━
+💰 *PAGO PARA APARTAR*
+━━━━━━━━━━━━━━━━
+Realiza el pago por Llave Breve Falabella al:
+👉 *3057059517*
+
+Una vez realizado el pago, envíanos el *comprobante* aquí y un asesor confirmará tu reserva. 
+
+Cuando tengas tu consola lista, te indicamos cómo activarlo 🎮"""
 
 JUEGOS_MENU = """🎮 *JUEGOS XBOX* 🎮
 
@@ -204,7 +223,7 @@ CONTEXTO DEL NEGOCIO:
 - Vendemos juegos Xbox en 4 modalidades: Código, Principal, Secundaria, Secundaria con método
 - El pago es por Llave Breve Falabella al 3057059517
 - El cliente primero prueba y luego paga
-- Para activar Game Pass el cliente debe enviar el código alfanumérico en este mismo chat
+- Para activar Game Pass el cliente debe enviar el código de su consola en este mismo chat
 - No tenemos catálogo de juegos, cotizamos según lo que pida el cliente
 
 INSTRUCCIONES:
@@ -269,8 +288,41 @@ def webhook():
         estado = conversaciones[phone].get("estado", "menu")
         historial = conversaciones[phone].get("historial", [])
 
-        # Detectar código de activación
-        if es_codigo_activacion(text) and not conversaciones[phone].get("compro") and estado == "activacion":
+        # ── ESTADO: selección de meses ──
+        if estado == "seleccion_meses":
+            meses = extraer_meses(text)
+            if meses:
+                conversaciones[phone]["meses_seleccionados"] = meses
+                conversaciones[phone]["estado"] = "preguntar_consola"
+                send_message(phone, f"✅ ¡Perfecto! Seleccionaste *{meses}*.\n\n" + PREGUNTAR_CONSOLA)
+                return jsonify({"status": "ok"}), 200
+            else:
+                send_message(phone, "No entendí 😊 Por favor responde solo con el número de meses:\n\n1️⃣ 1 mes\n2️⃣ 2 meses\n3️⃣ 3 meses\n4️⃣ 6 meses\n5️⃣ 12 meses")
+                return jsonify({"status": "ok"}), 200
+
+        # ── ESTADO: preguntar si tiene consola ──
+        if estado == "preguntar_consola":
+            if "1" in text or "si" in text_lower or "sí" in text_lower or "tengo" in text_lower:
+                conversaciones[phone]["estado"] = "activacion"
+                send_message(phone, ACTIVACION)
+                meses = conversaciones[phone].get("meses_seleccionados", "No especificado")
+                alerta = f"🎮 *NUEVO CLIENTE - Game Line Col* 🎮\n\nCliente: *+{phone}*\n⏳ Meses: *{meses}*\n\n¡Espera su código de activación! 🚀"
+                send_message(ADMIN_PHONE, alerta)
+                return jsonify({"status": "ok"}), 200
+            elif "2" in text or "no" in text_lower or "apartar" in text_lower:
+                conversaciones[phone]["estado"] = "apartar"
+                meses = conversaciones[phone].get("meses_seleccionados", "No especificado")
+                send_message(phone, APARTAR_SERVICIO)
+                alerta = f"💳 *CLIENTE QUIERE APARTAR - Game Line Col* 💳\n\nCliente: *+{phone}*\n⏳ Meses: *{meses}*\n\n¡Espera el comprobante de pago! 🚀"
+                send_message(ADMIN_PHONE, alerta)
+                registrar_cliente(phone, text, f"Game Pass - {meses}", "💳 Quiere apartar servicio")
+                return jsonify({"status": "ok"}), 200
+            else:
+                send_message(phone, PREGUNTAR_CONSOLA)
+                return jsonify({"status": "ok"}), 200
+
+        # ── ESTADO: esperando código de consola ──
+        if estado == "activacion" and es_codigo_consola(text):
             meses = conversaciones[phone].get("meses_seleccionados", "No especificado")
             conversaciones[phone]["compro"] = True
             send_message(phone, "✅ ¡Código recibido! Nuestro asesor lo activará en breve. ¡Gracias por tu compra! 🎮")
@@ -279,7 +331,8 @@ def webhook():
             registrar_cliente(phone, f"Código: {text}", f"Game Pass - {meses}", "💰 COMPRA CONFIRMADA")
             return jsonify({"status": "ok"}), 200
 
-        if text == "1" or "game pass" in text_lower:
+        # ── MENÚ PRINCIPAL ──
+        if text == "1" or ("game pass" in text_lower and estado == "menu"):
             conversaciones[phone]["estado"] = "gamepass"
             historial.append({"role": "user", "content": text})
             historial.append({"role": "assistant", "content": GAMEPASS})
@@ -305,30 +358,12 @@ def webhook():
             send_message(ADMIN_PHONE, alerta)
             return jsonify({"status": "ok"}), 200
 
-        # Cliente dice SÍ para contratar
         if estado == "gamepass" and text_lower in ["si", "sí", "yes", "quiero", "dale", "listo"]:
             conversaciones[phone]["estado"] = "seleccion_meses"
             send_message(phone, PREGUNTAR_MESES)
-            registrar_cliente(phone, text, "Game Pass Ultimate", "Quiere contratar ✅")
             return jsonify({"status": "ok"}), 200
 
-        # Cliente elige meses
-        if estado == "seleccion_meses":
-            meses = extraer_meses(text)
-            if meses:
-                conversaciones[phone]["meses_seleccionados"] = meses
-                conversaciones[phone]["estado"] = "activacion"
-                historial.append({"role": "user", "content": text})
-                historial.append({"role": "assistant", "content": ACTIVACION})
-                conversaciones[phone]["historial"] = historial
-                send_message(phone, f"✅ ¡Perfecto! Seleccionaste *{meses}*.\n\n" + ACTIVACION)
-                alerta = f"🎮 *NUEVO CLIENTE - Game Line Col* 🎮\n\nEl cliente *+{phone}* quiere contratar:\n⏳ *{meses}* de Game Pass Ultimate\n\n¡Espera su código de activación! 🚀"
-                send_message(ADMIN_PHONE, alerta)
-                return jsonify({"status": "ok"}), 200
-            else:
-                send_message(phone, "No entendí la cantidad de meses 😊 Por favor responde con un número:\n\n1️⃣ 1 mes\n2️⃣ 2 meses\n3️⃣ 3 meses\n4️⃣ 6 meses\n5️⃣ 12 meses")
-                return jsonify({"status": "ok"}), 200
-
+        # ── RESPUESTA CON IA ──
         historial.append({"role": "user", "content": text})
 
         historial_texto = "\n".join([
