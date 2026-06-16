@@ -356,7 +356,7 @@ def webhook():
                 )
                 send_message(ADMIN_PHONE, alerta)
             elif "2" in text or "no" in text_lower or "apartar" in text_lower:
-                conversaciones[phone]["estado"] = "esperando_comprobante")
+                conversaciones[phone]["estado"] = "esperando_comprobante"
                 send_message(phone, APARTAR)
                 alerta = (
                     "💳 *CLIENTE QUIERE APARTAR - Game Line Col* 💳\n\n"
