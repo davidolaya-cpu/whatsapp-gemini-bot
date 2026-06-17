@@ -62,7 +62,6 @@ def send_message(phone, message):
 
 def es_codigo_consola(texto):
     texto = texto.strip()
-    # Códigos de consola Xbox: letras y números, entre 6 y 25 caracteres
     return bool(re.match(r'^[A-Za-z0-9]{6,25}$', texto))
 
 def extraer_meses(texto):
@@ -161,10 +160,64 @@ PREGUNTAR_MESES = """⏳ ¡Perfecto! ¿Por cuántos meses deseas contratar el se
 
 Responde con el número de meses 😊"""
 
-PREGUNTAR_CONSOLA = """✅ ¡Perfecto! ¿Tienes tu consola o PC disponible en este momento para generar el código de activación?
+PREGUNTAR_TIPO_CUENTA = """🎯 ¿Qué tipo de cuenta prefieres?
+
+1️⃣ *Cuenta Principal*
+🏠 Juegas desde tu cuenta personal sin iniciar sesión en otra cuenta
+
+2️⃣ *Cuenta Secundaria*
+👤 Juegas desde tu cuenta personal iniciando sesión en la cuenta del servicio
+
+Ambas funcionan perfecto, solo cambia la configuración 😊"""
+
+PREGUNTAR_CONSOLA = """✅ ¿Tienes tu consola o PC disponible en este momento para generar el código de activación?
 
 1️⃣ *Sí, tengo mi consola/PC disponible*
 2️⃣ *No, quiero apartar el servicio y activarlo después*"""
+
+CONFIG_PRINCIPAL = """✅ ¡Perfecto! Una vez habilitemos tu cuenta con el código, sigue estos pasos en tu consola:
+
+━━━━━━━━━━━━━━━━
+🏠 *CONFIGURACIÓN CUENTA PRINCIPAL*
+━━━━━━━━━━━━━━━━
+
+Cuando aparezcan las preguntas de asociación de cuenta Game Pass Ultimate:
+
+1️⃣ *SIGUIENTE*
+2️⃣ *NO GRACIAS*
+3️⃣ *SIN BARRERAS*
+4️⃣ *OMITIR*
+5️⃣ En la pregunta de hacer Xbox principal → *HACER XBOX PRINCIPAL* ✅
+
+━━━━━━━━━━━━━━━━
+⚠️ *IMPORTANTE*
+━━━━━━━━━━━━━━━━
+Siempre vas a usar el servicio con la sesión iniciada de *tu cuenta personal*. La cuenta que añadimos *nunca la inicies*.
+
+🔒 El uso es *exclusivo para ti*, no la puedes compartir. Si llegase a pasar, la penalización es quitarte el servicio *sin devolución del dinero*."""
+
+CONFIG_SECUNDARIA = """✅ ¡Perfecto! Una vez habilitemos tu cuenta con el código, sigue estos pasos en tu consola:
+
+━━━━━━━━━━━━━━━━
+👤 *CONFIGURACIÓN CUENTA SECUNDARIA*
+━━━━━━━━━━━━━━━━
+
+Cuando aparezcan las preguntas de asociación de cuenta Game Pass Ultimate:
+
+1️⃣ *SIGUIENTE*
+2️⃣ *NO GRACIAS*
+3️⃣ *SIN BARRERAS*
+4️⃣ *VINCULAR CONTROL*
+5️⃣ En la pregunta de hacer Xbox principal → *NO CAMBIAR* ⛔
+
+⚠️ *¡Mucho cuidado con esa pregunta! Debes dar en NO CAMBIAR*
+
+━━━━━━━━━━━━━━━━
+⚠️ *IMPORTANTE*
+━━━━━━━━━━━━━━━━
+Siempre con la *sesión iniciada de la cuenta que acabamos de añadir* y juegas directo con tu cuenta personal.
+
+🔒 El uso es *exclusivo para ti*, no la puedes compartir. Si llegase a pasar, la penalización es quitarte el servicio *sin devolución del dinero*."""
 
 ACTIVACION = """📲 Sigue estos pasos en tu consola o PC:
 
@@ -182,7 +235,7 @@ APARTAR_SERVICIO = """💳 ¡Sin problema! Puedes apartar tu servicio pagando ah
 Realiza el pago por Llave Breve Falabella al:
 👉 *3057059517*
 
-Una vez realizado el pago, envíanos el *comprobante* aquí y un asesor confirmará tu reserva. 
+Una vez realizado el pago, envíanos el *comprobante aquí* 📸 y un asesor confirmará tu reserva.
 
 Cuando tengas tu consola lista, te indicamos cómo activarlo 🎮"""
 
@@ -225,6 +278,7 @@ CONTEXTO DEL NEGOCIO:
 - El cliente primero prueba y luego paga
 - Para activar Game Pass el cliente debe enviar el código de su consola en este mismo chat
 - No tenemos catálogo de juegos, cotizamos según lo que pida el cliente
+- Cuenta Principal y Secundaria funcionan igual de bien, solo cambia la configuración
 
 INSTRUCCIONES:
 - Usa el historial de conversación para dar respuestas coherentes y contextuales
@@ -276,7 +330,8 @@ def webhook():
                 "ultima_interaccion": time.time(),
                 "recordatorio_enviado": False,
                 "compro": False,
-                "meses_seleccionados": None
+                "meses_seleccionados": None,
+                "tipo_cuenta": None
             }
             send_message(phone, BIENVENIDA)
             registrar_cliente(phone, text, "Inicio", "Bienvenida enviada")
@@ -287,48 +342,90 @@ def webhook():
 
         estado = conversaciones[phone].get("estado", "menu")
         historial = conversaciones[phone].get("historial", [])
+        meses = conversaciones[phone].get("meses_seleccionados", "No especificado")
+        tipo_cuenta = conversaciones[phone].get("tipo_cuenta", "No especificado")
 
         # ── ESTADO: selección de meses ──
         if estado == "seleccion_meses":
-            meses = extraer_meses(text)
-            if meses:
-                conversaciones[phone]["meses_seleccionados"] = meses
-                conversaciones[phone]["estado"] = "preguntar_consola"
-                send_message(phone, f"✅ ¡Perfecto! Seleccionaste *{meses}*.\n\n" + PREGUNTAR_CONSOLA)
-                return jsonify({"status": "ok"}), 200
+            m = extraer_meses(text)
+            if m:
+                conversaciones[phone]["meses_seleccionados"] = m
+                conversaciones[phone]["estado"] = "seleccion_cuenta"
+                send_message(phone, f"✅ Seleccionaste *{m}*.\n\n" + PREGUNTAR_TIPO_CUENTA)
             else:
-                send_message(phone, "No entendí 😊 Por favor responde solo con el número de meses:\n\n1️⃣ 1 mes\n2️⃣ 2 meses\n3️⃣ 3 meses\n4️⃣ 6 meses\n5️⃣ 12 meses")
-                return jsonify({"status": "ok"}), 200
+                send_message(phone, "No entendí 😊 Responde con el número de meses:\n\n1️⃣ 1 mes\n2️⃣ 2 meses\n3️⃣ 3 meses\n4️⃣ 6 meses\n5️⃣ 12 meses")
+            return jsonify({"status": "ok"}), 200
+
+        # ── ESTADO: selección tipo de cuenta ──
+        if estado == "seleccion_cuenta":
+            if "1" in text or "principal" in text_lower:
+                conversaciones[phone]["tipo_cuenta"] = "Principal"
+                conversaciones[phone]["estado"] = "preguntar_consola"
+                send_message(phone, "🏠 ¡Elegiste *Cuenta Principal*!\n\n" + PREGUNTAR_CONSOLA)
+            elif "2" in text or "secundaria" in text_lower:
+                conversaciones[phone]["tipo_cuenta"] = "Secundaria"
+                conversaciones[phone]["estado"] = "preguntar_consola"
+                send_message(phone, "👤 ¡Elegiste *Cuenta Secundaria*!\n\n" + PREGUNTAR_CONSOLA)
+            elif "diferencia" in text_lower or "recomienda" in text_lower or "cual" in text_lower:
+                send_message(phone, "Ambas funcionan perfecto 😊\n\n🏠 *Principal:* Juegas sin iniciar sesión en otra cuenta.\n👤 *Secundaria:* Juegas iniciando sesión en la cuenta del servicio.\n\n¿Cuál prefieres?\n1️⃣ Principal\n2️⃣ Secundaria")
+            else:
+                send_message(phone, PREGUNTAR_TIPO_CUENTA)
+            return jsonify({"status": "ok"}), 200
 
         # ── ESTADO: preguntar si tiene consola ──
         if estado == "preguntar_consola":
+            tipo_cuenta = conversaciones[phone].get("tipo_cuenta", "No especificado")
+            meses = conversaciones[phone].get("meses_seleccionados", "No especificado")
             if "1" in text or "si" in text_lower or "sí" in text_lower or "tengo" in text_lower:
                 conversaciones[phone]["estado"] = "activacion"
                 send_message(phone, ACTIVACION)
-                meses = conversaciones[phone].get("meses_seleccionados", "No especificado")
-                alerta = f"🎮 *NUEVO CLIENTE - Game Line Col* 🎮\n\nCliente: *+{phone}*\n⏳ Meses: *{meses}*\n\n¡Espera su código de activación! 🚀"
+                alerta = f"🎮 *NUEVO CLIENTE - Game Line Col* 🎮\n\nCliente: *+{phone}*\n⏳ Meses: *{meses}*\n🎯 Cuenta: *{tipo_cuenta}*\n\n¡Espera su código de activación! 🚀"
                 send_message(ADMIN_PHONE, alerta)
-                return jsonify({"status": "ok"}), 200
             elif "2" in text or "no" in text_lower or "apartar" in text_lower:
-                conversaciones[phone]["estado"] = "apartar"
-                meses = conversaciones[phone].get("meses_seleccionados", "No especificado")
+                conversaciones[phone]["estado"] = "esperando_comprobante"
                 send_message(phone, APARTAR_SERVICIO)
-                alerta = f"💳 *CLIENTE QUIERE APARTAR - Game Line Col* 💳\n\nCliente: *+{phone}*\n⏳ Meses: *{meses}*\n\n¡Espera el comprobante de pago! 🚀"
+                alerta = f"💳 *CLIENTE QUIERE APARTAR - Game Line Col* 💳\n\nCliente: *+{phone}*\n⏳ Meses: *{meses}*\n🎯 Cuenta: *{tipo_cuenta}*\n\n¡Espera el comprobante de pago! 🚀"
                 send_message(ADMIN_PHONE, alerta)
-                registrar_cliente(phone, text, f"Game Pass - {meses}", "💳 Quiere apartar servicio")
-                return jsonify({"status": "ok"}), 200
+                registrar_cliente(phone, text, f"Game Pass {tipo_cuenta} - {meses}", "💳 Quiere apartar servicio")
             else:
                 send_message(phone, PREGUNTAR_CONSOLA)
-                return jsonify({"status": "ok"}), 200
+            return jsonify({"status": "ok"}), 200
 
         # ── ESTADO: esperando código de consola ──
         if estado == "activacion" and es_codigo_consola(text):
+            tipo_cuenta = conversaciones[phone].get("tipo_cuenta", "No especificado")
             meses = conversaciones[phone].get("meses_seleccionados", "No especificado")
+            config = CONFIG_PRINCIPAL if tipo_cuenta == "Principal" else CONFIG_SECUNDARIA
             conversaciones[phone]["compro"] = True
-            send_message(phone, "✅ ¡Código recibido! Nuestro asesor lo activará en breve. ¡Gracias por tu compra! 🎮")
-            alerta = f"🎮 *CÓDIGO DE ACTIVACIÓN - Game Line Col* 🎮\n\nCliente: *+{phone}*\n⏳ Meses contratados: *{meses}*\n🔑 Código: *{text}*\n\n¡Activa el servicio! 🚀"
+            send_message(phone, "✅ ¡Código recibido! Nuestro asesor lo activará en breve. 🎮\n\nMientras tanto, guarda estos pasos para cuando se habilite tu cuenta:")
+            send_message(phone, config)
+            alerta = f"🎮 *CÓDIGO DE ACTIVACIÓN - Game Line Col* 🎮\n\nCliente: *+{phone}*\n⏳ Meses: *{meses}*\n🎯 Cuenta: *{tipo_cuenta}*\n🔑 Código: *{text}*\n\n¡Activa el servicio! 🚀"
             send_message(ADMIN_PHONE, alerta)
-            registrar_cliente(phone, f"Código: {text}", f"Game Pass - {meses}", "💰 COMPRA CONFIRMADA")
+            registrar_cliente(phone, f"Código: {text}", f"Game Pass {tipo_cuenta} - {meses}", "💰 COMPRA CONFIRMADA")
+            return jsonify({"status": "ok"}), 200
+
+        # ── ESTADO: esperando comprobante de pago ──
+        if estado == "esperando_comprobante":
+            tipo_cuenta = conversaciones[phone].get("tipo_cuenta", "No especificado")
+            meses = conversaciones[phone].get("meses_seleccionados", "No especificado")
+            conversaciones[phone]["estado"] = "esperando_codigo_apartado"
+            send_message(phone, "✅ ¡Comprobante recibido! Un asesor confirmará tu reserva en breve.\n\nCuando tengas tu consola lista, envíanos el código de activación aquí y lo activamos de inmediato 🎮")
+            alerta = f"💳 *COMPROBANTE DE PAGO - Game Line Col* 💳\n\nCliente: *+{phone}*\n⏳ Meses: *{meses}*\n🎯 Cuenta: *{tipo_cuenta}*\n\n¡Confirma el pago y reserva el servicio! 🚀"
+            send_message(ADMIN_PHONE, alerta)
+            registrar_cliente(phone, "Comprobante enviado", f"Game Pass {tipo_cuenta} - {meses}", "💰 PAGO RECIBIDO - Servicio apartado")
+            return jsonify({"status": "ok"}), 200
+
+        # ── ESTADO: esperando código de cliente que apartó ──
+        if estado == "esperando_codigo_apartado" and es_codigo_consola(text):
+            tipo_cuenta = conversaciones[phone].get("tipo_cuenta", "No especificado")
+            meses = conversaciones[phone].get("meses_seleccionados", "No especificado")
+            config = CONFIG_PRINCIPAL if tipo_cuenta == "Principal" else CONFIG_SECUNDARIA
+            conversaciones[phone]["compro"] = True
+            send_message(phone, "✅ ¡Código recibido! Nuestro asesor lo activará en breve. 🎮\n\nMientras tanto, guarda estos pasos para cuando se habilite tu cuenta:")
+            send_message(phone, config)
+            alerta = f"🎮 *CÓDIGO ACTIVACIÓN (APARTADO) - Game Line Col* 🎮\n\nCliente: *+{phone}*\n⏳ Meses: *{meses}*\n🎯 Cuenta: *{tipo_cuenta}*\n🔑 Código: *{text}*\n\n¡Activa el servicio! 🚀"
+            send_message(ADMIN_PHONE, alerta)
+            registrar_cliente(phone, f"Código: {text}", f"Game Pass {tipo_cuenta} - {meses}", "🎮 CÓDIGO RECIBIDO - Activar servicio")
             return jsonify({"status": "ok"}), 200
 
         # ── MENÚ PRINCIPAL ──
@@ -365,48 +462,6 @@ def webhook():
 
         # ── RESPUESTA CON IA ──
         historial.append({"role": "user", "content": text})
-
         historial_texto = "\n".join([
             f"{'Cliente' if h['role'] == 'user' else 'GameBot'}: {h['content']}"
-            for h in historial[-10:]
-        ])
-
-        response = client.models.generate_content(
-            model="gemini-2.5-flash-lite",
-            contents=f"{SYSTEM_PROMPT}\n\nHistorial de conversación:\n{historial_texto}\n\nResponde al último mensaje del cliente.",
-            config=types.GenerateContentConfig(
-                tools=[types.Tool(google_search=types.GoogleSearch())]
-            )
-        )
-        reply = response.text
-
-        if "ALERTA_JUEGO:" in reply:
-            match = re.search(r'ALERTA_JUEGO:([^\n]+)', reply)
-            nombre_juego = match.group(1).strip() if match else text
-            reply = re.sub(r'ALERTA_JUEGO:[^\n]+', '', reply).strip()
-            conversaciones[phone]["compro"] = True
-            registrar_cliente(phone, text, f"Juego: {nombre_juego}", "🎮 Cotización solicitada")
-            alerta = f"🎮 *COTIZACIÓN DE JUEGO - Game Line Col* 🎮\n\nEl cliente *+{phone}* busca:\n👉 *{nombre_juego}*\n\nPor favor cotiza y respóndele."
-            send_message(ADMIN_PHONE, alerta)
-
-        elif "ALERTA_ASESOR" in reply:
-            reply = reply.replace("ALERTA_ASESOR", "").strip()
-            registrar_cliente(phone, text, "Consulta general", "🚨 Necesita asesor")
-            alerta = f"🚨 *ALERTA Game Line Col* 🚨\n\nEl cliente *+{phone}* necesita un asesor.\n\n💬 Su pregunta:\n_{text}_"
-            send_message(ADMIN_PHONE, alerta)
-
-        else:
-            registrar_cliente(phone, text, "Consulta general", "Respondido por bot ✅")
-
-        historial.append({"role": "assistant", "content": reply})
-        conversaciones[phone]["historial"] = historial[-20:]
-
-        send_message(phone, reply)
-
-    except Exception as e:
-        print(f"Error: {e}")
-    return jsonify({"status": "ok"}), 200
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+            for 
