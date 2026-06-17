@@ -141,6 +141,7 @@ def webhook():
             return jsonify({"status": "ok"}), 200
 
         phone = message["from"]
+        msg_id = message.get("id", "")
         text = message["text"]["body"].strip()
         text_lower = text.lower()
 
@@ -156,8 +157,14 @@ def webhook():
                 "compro": False,
                 "meses": None,
                 "tipo_cuenta": None,
-                "bienvenida_enviada": False
+                "bienvenida_enviada": False,
+                "ultimo_msg_id": ""
             }
+
+        # Filtrar mensajes duplicados
+        if msg_id and msg_id == conversaciones[phone].get("ultimo_msg_id", ""):
+            return jsonify({"status": "ok"}), 200
+        conversaciones[phone]["ultimo_msg_id"] = msg_id
 
         if not conversaciones[phone].get("bienvenida_enviada") or es_saludo:
             conversaciones[phone]["bienvenida_enviada"] = True
