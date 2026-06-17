@@ -462,7 +462,9 @@ def webhook():
 
         # ── RESPUESTA CON IA ──
         historial.append({"role": "user", "content": text})
-        historial_texto = "\n".join(
-    ("Cliente: " if h["role"] == "user" else "GameBot: ") + h["content"]
-    for h in historial[-10:]
-        )
+        historial_texto = ""
+        for h in historial[-10:]:
+            rol = "Cliente" if h["role"] == "user" else "GameBot"
+            historial_texto += rol + ": " + h["content"] + "\n"
+
+        response = client.models.generate_content(
