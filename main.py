@@ -462,6 +462,7 @@ def webhook():
 
         # ── RESPUESTA CON IA ──
         historial.append({"role": "user", "content": text})
-        historial_texto = "\n".join([
-            f"{'Cliente' if h['role'] == 'user' else 'GameBot'}: {h['content']}"
-            for 
+        historial_texto = "\n".join(
+    ("Cliente: " if h["role"] == "user" else "GameBot: ") + h["content"]
+    for h in historial[-10:]
+        )
