@@ -170,6 +170,8 @@ def webhook():
         conversaciones[phone]["ultima_interaccion"] = time.time()
         conversaciones[phone]["recordatorio_enviado"] = False
         estado = conversaciones[phone].get("estado", "menu")
+        print("ESTADO: " + estado + " | TEXTO: " + text)
+
         historial = conversaciones[phone].get("historial", [])
         meses = conversaciones[phone].get("meses", "No especificado")
         tipo_cuenta = conversaciones[phone].get("tipo_cuenta", "No especificado")
