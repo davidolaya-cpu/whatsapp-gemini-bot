@@ -61,8 +61,13 @@ def send_message(phone, message):
     r = requests.post(url, headers=headers, json=payload)
     return r.json()
 
+PALABRAS_COMUNES = ["gracias", "listo", "vale", "ok", "okay", "perfecto", "genial", "bueno",
+                     "claro", "entendido", "excelente", "graciaz", "thanks", "dale", "bien"]
+
 def es_codigo_consola(texto):
     texto = texto.strip()
+    if texto.lower() in PALABRAS_COMUNES:
+        return False
     return bool(re.match(r'^[A-Za-z0-9]{6,25}$', texto))
 
 def extraer_meses(texto):
@@ -79,6 +84,11 @@ def extraer_meses(texto):
         if texto == key or key in texto:
             return value
     return None
+
+def es_agradecimiento(texto):
+    texto = texto.lower().strip()
+    palabras = ["gracias", "thanks", "thank you", "muchas gracias", "mil gracias", "graciaz"]
+    return any(p in texto for p in palabras)
 
 def verificar_seguimientos():
     while True:
@@ -119,6 +129,8 @@ APARTAR = "Sin problema! Aparta tu servicio pagando ahora.\n\nPago por Llave Bre
 JUEGOS = "JUEGOS XBOX\n\n1 CODIGO (Economico)\nJuego desde Microsoft, para tu cuenta de por vida\n\n2 CUENTA PRINCIPAL (+ Economico)\nAcceso de por vida, sin iniciar sesion en otra cuenta\n\n3 CUENTA SECUNDARIA (++ Economico)\nAcceso de por vida, iniciando sesion en la cuenta del juego\n\n4 SECUNDARIA CON METODO (+++ Economico)\nAcceso de por vida con tutorial que compartimos\n\nQue juego buscas? Dinos el nombre 👇"
 
 SOPORTE = "SOPORTE\n\nUn asesor te atendera personalmente.\n\nEscribenos al: +57 322 908 2927 😊"
+
+CIERRE = "🎮 Con mucho gusto! Gracias a ti por confiar en Game Line Col 🙌\n\nCualquier cosa que necesites aqui estamos. Que disfrutes tu juego! 🚀"
 
 PROMPT = "Eres GameBot de Game Line Col. Responde en espanol, amable y profesional. Si el cliente pregunta por un juego especifico termina con ALERTA_JUEGO:[nombre]. Si no puedes resolver algo termina con ALERTA_ASESOR. No inventes precios."
 
@@ -192,6 +204,12 @@ def webhook():
             conversaciones[phone]["ultima_interaccion"] = time.time()
             send_message(phone, BIENVENIDA)
             registrar_cliente(phone, text, "Inicio", "Bienvenida enviada")
+            return jsonify({"status": "ok"}), 200
+
+        # ── AGRADECIMIENTO EN CUALQUIER MOMENTO (cierre de venta) ──
+        if es_agradecimiento(text) and conversaciones[phone].get("compro"):
+            conversaciones[phone]["ultima_interaccion"] = time.time()
+            send_message(phone, CIERRE)
             return jsonify({"status": "ok"}), 200
 
         conversaciones[phone]["ultima_interaccion"] = time.time()
@@ -298,6 +316,11 @@ def webhook():
             send_message(phone, PREGUNTAR_MESES)
             return jsonify({"status": "ok"}), 200
 
+        # ── AGRADECIMIENTO SIN COMPRA AUN (despedida general) ──
+        if es_agradecimiento(text):
+            send_message(phone, "🎮 Con mucho gusto! Cualquier cosa que necesites aqui estamos 😊")
+            return jsonify({"status": "ok"}), 200
+
         historial.append({"role": "user", "content": text})
         historial_texto = ""
         for h in historial[-10:]:
@@ -331,12 +354,4 @@ def webhook():
 
         historial.append({"role": "assistant", "content": reply})
         conversaciones[phone]["historial"] = historial[-20:]
-        send_message(phone, reply)
-
-    except Exception as e:
-        print("Error: " + str(e))
-    return jsonify({"status": "ok"}), 200
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+       
