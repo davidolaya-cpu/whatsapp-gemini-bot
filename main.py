@@ -351,7 +351,7 @@ def webhook():
             send_message(ADMIN_PHONE, alerta)
         else:
             registrar_cliente(phone, text, "Consulta", "Respondido por bot")
-
-        historial.append({"role": "assistant", "content": reply})
+historial.append({"role": "assistant", "content": reply})
         conversaciones[phone]["historial"] = historial[-20:]
+        
        
