@@ -24,6 +24,7 @@ HORA_SEGUIMIENTO = 3600
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
+
 def get_sheets_service():
     creds_dict = json.loads(GOOGLE_CREDENTIALS)
     creds = service_account.Credentials.from_service_account_info(
@@ -32,11 +33,12 @@ def get_sheets_service():
     )
     return build("sheets", "v4", credentials=creds)
 
+
 def registrar_cliente(phone, mensaje, servicio, estado):
     try:
         service = get_sheets_service()
         fecha = datetime.now().strftime("%d/%m/%Y %H:%M")
-        valores = [[fecha, "+"+phone, mensaje, servicio, estado]]
+        valores = [[fecha, "+" + phone, mensaje, servicio, estado]]
         service.spreadsheets().values().append(
             spreadsheetId=SHEET_ID,
             range="A:E",
@@ -45,6 +47,7 @@ def registrar_cliente(phone, mensaje, servicio, estado):
         ).execute()
     except Exception as e:
         print("Error Sheets: " + str(e))
+
 
 def send_message(phone, message):
     url = "https://graph.facebook.com/v18.0/" + PHONE_NUMBER_ID + "/messages"
@@ -61,14 +64,17 @@ def send_message(phone, message):
     r = requests.post(url, headers=headers, json=payload)
     return r.json()
 
+
 PALABRAS_COMUNES = ["gracias", "listo", "vale", "ok", "okay", "perfecto", "genial", "bueno",
                      "claro", "entendido", "excelente", "graciaz", "thanks", "dale", "bien"]
+
 
 def es_codigo_consola(texto):
     texto = texto.strip()
     if texto.lower() in PALABRAS_COMUNES:
         return False
     return bool(re.match(r'^[A-Za-z0-9]{6,25}$', texto))
+
 
 def extraer_meses(texto):
     texto = texto.lower().strip()
@@ -85,10 +91,12 @@ def extraer_meses(texto):
             return value
     return None
 
+
 def es_agradecimiento(texto):
     texto = texto.lower().strip()
     palabras = ["gracias", "thanks", "thank you", "muchas gracias", "mil gracias", "graciaz"]
     return any(p in texto for p in palabras)
+
 
 def verificar_seguimientos():
     while True:
@@ -104,6 +112,7 @@ def verificar_seguimientos():
                 send_message(phone, msg)
                 conversaciones[phone]["recordatorio_enviado"] = True
                 registrar_cliente(phone, "Recordatorio", "Seguimiento", "Recordatorio enviado")
+
 
 conversaciones = {}
 threading.Thread(target=verificar_seguimientos, daemon=True).start()
@@ -134,6 +143,7 @@ CIERRE = "🎮 Con mucho gusto! Gracias a ti por confiar en Game Line Col 🙌\n
 
 PROMPT = "Eres GameBot de Game Line Col. Responde en espanol, amable y profesional. Si el cliente pregunta por un juego especifico termina con ALERTA_JUEGO:[nombre]. Si no puedes resolver algo termina con ALERTA_ASESOR. No inventes precios."
 
+
 @app.route("/webhook", methods=["GET"])
 def verify():
     token = request.args.get("hub.verify_token")
@@ -141,6 +151,7 @@ def verify():
     if token == VERIFY_TOKEN:
         return challenge, 200
     return "Token invalido", 403
+
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -158,7 +169,6 @@ def webhook():
         text = message["text"]["body"].strip()
         text_lower = text.lower()
 
-        # ── COMANDO DEL ADMIN: "activo XXXX" ──
         if phone == ADMIN_PHONE and text_lower.startswith("activo"):
             ultimos_4 = text_lower.replace("activo", "").strip()
             cliente_encontrado = None
@@ -168,14 +178,14 @@ def webhook():
                     break
 
             if cliente_encontrado:
-                tipo_cuenta = conversaciones[cliente_encontrado].get("tipo_cuenta", "Principal")
-                config = CONFIG_PRINCIPAL if tipo_cuenta == "Principal" else CONFIG_SECUNDARIA
-                mensaje_activo = "✅ Tu cuenta ha sido activada en la consola! 🎮\n\nYa puedes empezar a jugar. Sigue estas instrucciones:\n\n" + config
+                tipo_cuenta_c = conversaciones[cliente_encontrado].get("tipo_cuenta", "Principal")
+                config_c = CONFIG_PRINCIPAL if tipo_cuenta_c == "Principal" else CONFIG_SECUNDARIA
+                mensaje_activo = "✅ Tu cuenta ha sido activada en la consola! 🎮\n\nYa puedes empezar a jugar. Sigue estas instrucciones:\n\n" + config_c
                 send_message(cliente_encontrado, mensaje_activo)
                 send_message(ADMIN_PHONE, "✅ Confirmacion enviada al cliente +" + cliente_encontrado)
-                registrar_cliente(cliente_encontrado, "Activacion confirmada", "Game Pass " + tipo_cuenta, "✅ CUENTA ACTIVADA - Confirmado")
+                registrar_cliente(cliente_encontrado, "Activacion confirmada", "Game Pass " + tipo_cuenta_c, "CUENTA ACTIVADA")
             else:
-                send_message(ADMIN_PHONE, "⚠️ No encontre un cliente pendiente con esos ultimos 4 digitos: " + ultimos_4)
+                send_message(ADMIN_PHONE, "No encontre un cliente pendiente con esos ultimos 4 digitos: " + ultimos_4)
             return jsonify({"status": "ok"}), 200
 
         saludos = ["hola", "buenas", "buenos dias", "buenas tardes", "buenas noches", "hi", "hello", "inicio"]
@@ -206,7 +216,6 @@ def webhook():
             registrar_cliente(phone, text, "Inicio", "Bienvenida enviada")
             return jsonify({"status": "ok"}), 200
 
-        # ── AGRADECIMIENTO EN CUALQUIER MOMENTO (cierre de venta) ──
         if es_agradecimiento(text) and conversaciones[phone].get("compro"):
             conversaciones[phone]["ultima_interaccion"] = time.time()
             send_message(phone, CIERRE)
@@ -316,7 +325,6 @@ def webhook():
             send_message(phone, PREGUNTAR_MESES)
             return jsonify({"status": "ok"}), 200
 
-        # ── AGRADECIMIENTO SIN COMPRA AUN (despedida general) ──
         if es_agradecimiento(text):
             send_message(phone, "🎮 Con mucho gusto! Cualquier cosa que necesites aqui estamos 😊")
             return jsonify({"status": "ok"}), 200
@@ -351,7 +359,16 @@ def webhook():
             send_message(ADMIN_PHONE, alerta)
         else:
             registrar_cliente(phone, text, "Consulta", "Respondido por bot")
-historial.append({"role": "assistant", "content": reply})
+
+        historial.append({"role": "assistant", "content": reply})
         conversaciones[phone]["historial"] = historial[-20:]
-        
-       
+        send_message(phone, reply)
+
+    except Exception as e:
+        print("Error: " + str(e))
+    return jsonify({"status": "ok"}), 200
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
