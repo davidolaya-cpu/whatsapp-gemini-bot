@@ -21,6 +21,7 @@ GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS")
 SHEET_ID = "1lvIlK1LYbT68HsuDTbMRzWSYh_RGUPHAZeV31_sAmdU"
 ADMIN_PHONE = "573229082927"
 HORA_SEGUIMIENTO = 3600
+HORA_SEGUIMIENTO_24H = 86400
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -49,7 +50,7 @@ def registrar_cliente(phone, mensaje, servicio, estado):
         print("Error Sheets: " + str(e))
 
 
-def send_message(phone, message):
+def send_message(phone, message, intentos=3):
     url = "https://graph.facebook.com/v18.0/" + PHONE_NUMBER_ID + "/messages"
     headers = {
         "Authorization": "Bearer " + WHATSAPP_TOKEN,
@@ -61,11 +62,21 @@ def send_message(phone, message):
         "type": "text",
         "text": {"body": message}
     }
-    r = requests.post(url, headers=headers, json=payload)
-    return r.json()
+    ultimo_resultado = None
+    for intento in range(intentos):
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=10)
+            ultimo_resultado = r.json()
+            if r.status_code < 400:
+                return ultimo_resultado
+            print("WhatsApp error (intento " + str(intento + 1) + "): " + str(ultimo_resultado))
+        except Exception as e:
+            print("Error enviando mensaje (intento " + str(intento + 1) + "): " + str(e))
+        time.sleep(2)
+    return ultimo_resultado
 
 
-def reenviar_imagen(phone, media_id, caption=""):
+def reenviar_imagen(phone, media_id, caption="", intentos=2):
     url = "https://graph.facebook.com/v18.0/" + PHONE_NUMBER_ID + "/messages"
     headers = {
         "Authorization": "Bearer " + WHATSAPP_TOKEN,
@@ -79,8 +90,18 @@ def reenviar_imagen(phone, media_id, caption=""):
     }
     if caption:
         payload["image"]["caption"] = caption
-    r = requests.post(url, headers=headers, json=payload)
-    return r.json()
+    for intento in range(intentos):
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=10)
+            data = r.json()
+            if r.status_code < 400:
+                return data
+            print("Error reenviando imagen (intento " + str(intento + 1) + "): " + str(data))
+        except Exception as e:
+            print("Error reenviando imagen (intento " + str(intento + 1) + "): " + str(e))
+        time.sleep(2)
+    send_message(ADMIN_PHONE, "⚠️ No pude reenviarte la foto del comprobante (puede que el enlace ya haya expirado). Pidele al cliente que la reenvie si la necesitas.")
+    return None
 
 
 def descargar_media(media_id):
@@ -144,6 +165,75 @@ def es_agradecimiento(texto):
     return any(p in texto for p in palabras)
 
 
+ESTADOS_RANGE = "Estados!A:B"
+
+
+def asegurar_hoja_estados():
+    try:
+        service = get_sheets_service()
+        body = {"requests": [{"addSheet": {"properties": {"title": "Estados"}}}]}
+        service.spreadsheets().batchUpdate(spreadsheetId=SHEET_ID, body=body).execute()
+        print("Hoja 'Estados' creada")
+    except Exception:
+        pass  # ya existe, no pasa nada
+
+
+def cargar_estados():
+    try:
+        service = get_sheets_service()
+        result = service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID, range=ESTADOS_RANGE
+        ).execute()
+        filas = result.get("values", [])
+        cargados = 0
+        for fila in filas[1:]:
+            if len(fila) >= 2:
+                try:
+                    conversaciones[fila[0]] = json.loads(fila[1])
+                    cargados += 1
+                except Exception:
+                    continue
+        print("Estados cargados desde Sheets: " + str(cargados))
+    except Exception as e:
+        print("Error cargando estados: " + str(e))
+
+
+def guardar_estados_periodico():
+    while True:
+        time.sleep(30)
+        try:
+            service = get_sheets_service()
+            filas = [["telefono", "json"]]
+            for phone, datos in list(conversaciones.items()):
+                filas.append([phone, json.dumps(datos)])
+            service.spreadsheets().values().clear(
+                spreadsheetId=SHEET_ID, range=ESTADOS_RANGE
+            ).execute()
+            service.spreadsheets().values().update(
+                spreadsheetId=SHEET_ID,
+                range="Estados!A1",
+                valueInputOption="RAW",
+                body={"values": filas}
+            ).execute()
+        except Exception as e:
+            print("Error guardando estados: " + str(e))
+
+
+ESTADOS_PENDIENTES = ["activacion", "esperando_comprobante", "esperando_codigo_apartado",
+                      "esperando_pago_final", "pago_final_enviado"]
+
+estadisticas_diarias = {"fecha": None, "nuevos": 0, "cierres": 0}
+
+
+def registrar_evento_diario(tipo):
+    hoy = datetime.now().strftime("%d/%m/%Y")
+    if estadisticas_diarias["fecha"] != hoy:
+        estadisticas_diarias["fecha"] = hoy
+        estadisticas_diarias["nuevos"] = 0
+        estadisticas_diarias["cierres"] = 0
+    estadisticas_diarias[tipo] = estadisticas_diarias.get(tipo, 0) + 1
+
+
 def verificar_seguimientos():
     while True:
         time.sleep(60)
@@ -153,15 +243,55 @@ def verificar_seguimientos():
                 continue
             ultima = datos.get("ultima_interaccion", 0)
             recordatorio_enviado = datos.get("recordatorio_enviado", False)
+            recordatorio_24h_enviado = datos.get("recordatorio_24h_enviado", False)
             if not recordatorio_enviado and (ahora - ultima) >= HORA_SEGUIMIENTO:
                 msg = "Hola! Te escribimos desde Game Line Col 🎮\n\nNotamos que estuviste interesado en nuestros servicios.\n\nEn que te podemos ayudar?\n\n1 Game Pass Ultimate\n2 Juegos Xbox\n3 Soporte"
                 send_message(phone, msg)
                 conversaciones[phone]["recordatorio_enviado"] = True
                 registrar_cliente(phone, "Recordatorio", "Seguimiento", "Recordatorio enviado")
+            elif recordatorio_enviado and not recordatorio_24h_enviado and (ahora - ultima) >= HORA_SEGUIMIENTO_24H:
+                msg = "Hola de nuevo! 🎮 Tu oferta sigue disponible.\n\n🔥 Si confirmas hoy tienes 10% de descuento en cualquiera de nuestros servicios.\n\nEscribenos y te ayudamos enseguida!"
+                send_message(phone, msg)
+                conversaciones[phone]["recordatorio_24h_enviado"] = True
+                registrar_cliente(phone, "Recordatorio 24h", "Seguimiento", "Recordatorio 24h con descuento enviado")
+
+
+def verificar_inactivos():
+    while True:
+        time.sleep(300)
+        ahora = time.time()
+        for phone, datos in list(conversaciones.items()):
+            if datos.get("estado") == "esperando_pago_final" and not datos.get("alerta_inactividad_enviada"):
+                ultima = datos.get("ultima_interaccion", 0)
+                if (ahora - ultima) >= 86400:
+                    msg = "⚠️ Cliente +" + phone + " lleva mas de 24h sin enviar el comprobante del pago final. Quizas valga la pena escribirle."
+                    send_message(ADMIN_PHONE, msg)
+                    conversaciones[phone]["alerta_inactividad_enviada"] = True
+
+
+def resumen_diario():
+    ultimo_envio = None
+    while True:
+        time.sleep(60)
+        ahora = datetime.now()
+        hoy = ahora.strftime("%d/%m/%Y")
+        if ahora.hour == 21 and ultimo_envio != hoy:
+            pendientes = sum(1 for d in conversaciones.values() if d.get("estado") in ESTADOS_PENDIENTES)
+            msg = ("📊 Resumen del dia " + hoy + "\n\n"
+                   "Nuevos clientes: " + str(estadisticas_diarias.get("nuevos", 0)) + "\n"
+                   "Cierres confirmados: " + str(estadisticas_diarias.get("cierres", 0)) + "\n"
+                   "Pendientes actuales: " + str(pendientes))
+            send_message(ADMIN_PHONE, msg)
+            ultimo_envio = hoy
 
 
 conversaciones = {}
+asegurar_hoja_estados()
+cargar_estados()
 threading.Thread(target=verificar_seguimientos, daemon=True).start()
+threading.Thread(target=verificar_inactivos, daemon=True).start()
+threading.Thread(target=resumen_diario, daemon=True).start()
+threading.Thread(target=guardar_estados_periodico, daemon=True).start()
 
 BIENVENIDA = "🎮 Bienvenido a Game Line Col! 🎮\n\nSomos tu tienda de confianza para juegos y suscripciones Xbox.\n\nEn que te podemos ayudar?\n\n1 Game Pass Ultimate (Xbox y PC)\n2 Juegos Xbox\n3 Soporte\n\nResponde con el numero de tu opcion 😊"
 
@@ -254,8 +384,24 @@ def webhook():
                 send_message(cliente_encontrado, CIERRE)
                 send_message(ADMIN_PHONE, "✅ Pago confirmado, mensaje de cierre enviado al cliente +" + cliente_encontrado)
                 registrar_cliente(cliente_encontrado, "Pago confirmado por admin", "Game Pass " + tipo_cuenta_c + " - " + meses_c, "PAGO CONFIRMADO - Cerrado")
+                registrar_evento_diario("cierres")
             else:
                 send_message(ADMIN_PHONE, "No encontre un cliente esperando confirmacion de pago con esos ultimos 4 digitos: " + ultimos_4)
+            return jsonify({"status": "ok"}), 200
+
+        if phone == ADMIN_PHONE and text_lower == "pendientes":
+            pendientes = []
+            for ph, datos in conversaciones.items():
+                if datos.get("estado") in ESTADOS_PENDIENTES:
+                    pendientes.append(
+                        "+" + ph + " (..." + ph[-4:] + ") - " + str(datos.get("estado")) +
+                        " - " + str(datos.get("meses")) + " - " + str(datos.get("tipo_cuenta"))
+                    )
+            if pendientes:
+                msg = "📋 Clientes pendientes (" + str(len(pendientes)) + "):\n\n" + "\n".join(pendientes)
+            else:
+                msg = "No hay clientes pendientes en este momento 🎉"
+            send_message(ADMIN_PHONE, msg)
             return jsonify({"status": "ok"}), 200
 
         saludos = ["hola", "buenas", "buenos dias", "buenas tardes", "buenas noches", "hi", "hello", "inicio"]
@@ -273,6 +419,7 @@ def webhook():
                 "bienvenida_enviada": False,
                 "ultimo_msg_id": ""
             }
+            registrar_evento_diario("nuevos")
 
         if msg_id and msg_id == conversaciones[phone].get("ultimo_msg_id", ""):
             return jsonify({"status": "ok"}), 200
