@@ -18,6 +18,8 @@ WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS")
+MP_ACCESS_TOKEN = os.environ.get("MP_ACCESS_TOKEN")
+MP_NOTIFICATION_URL = os.environ.get("MP_NOTIFICATION_URL")
 SHEET_ID = "1lvIlK1LYbT68HsuDTbMRzWSYh_RGUPHAZeV31_sAmdU"
 ADMIN_PHONE = "573229082927"
 HORA_SEGUIMIENTO = 3600
@@ -26,13 +28,19 @@ HORA_SEGUIMIENTO_24H = 86400
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 
+_sheets_service = None
+
+
 def get_sheets_service():
-    creds_dict = json.loads(GOOGLE_CREDENTIALS)
-    creds = service_account.Credentials.from_service_account_info(
-        creds_dict,
-        scopes=["https://www.googleapis.com/auth/spreadsheets"]
-    )
-    return build("sheets", "v4", credentials=creds)
+    global _sheets_service
+    if _sheets_service is None:
+        creds_dict = json.loads(GOOGLE_CREDENTIALS)
+        creds = service_account.Credentials.from_service_account_info(
+            creds_dict,
+            scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        )
+        _sheets_service = build("sheets", "v4", credentials=creds)
+    return _sheets_service
 
 
 def registrar_cliente(phone, mensaje, servicio, estado):
@@ -112,6 +120,59 @@ def descargar_media(media_id):
     mime_type = info.get("mime_type", "image/jpeg")
     media_resp = requests.get(media_url, headers=headers)
     return media_resp.content, mime_type
+
+
+PRECIOS_GAMEPASS = {
+    "1 mes": 29900,
+    "2 meses": 55000,
+    "3 meses": 80000,
+    "6 meses": 140000,
+    "12 meses": 190000
+}
+
+
+def crear_link_pago(phone, concepto, monto):
+    try:
+        referencia = phone + "-" + str(int(time.time()))
+        url = "https://api.mercadopago.com/checkout/preferences"
+        headers = {
+            "Authorization": "Bearer " + MP_ACCESS_TOKEN,
+            "Content-Type": "application/json"
+        }
+        body = {
+            "items": [{
+                "title": concepto,
+                "quantity": 1,
+                "unit_price": float(monto),
+                "currency_id": "COP"
+            }],
+            "external_reference": referencia,
+            "notification_url": MP_NOTIFICATION_URL,
+            "back_urls": {
+                "success": "https://www.mercadopago.com.co",
+                "failure": "https://www.mercadopago.com.co",
+                "pending": "https://www.mercadopago.com.co"
+            }
+        }
+        r = requests.post(url, headers=headers, json=body, timeout=10)
+        data = r.json()
+        link = data.get("init_point")
+        if not link:
+            print("Error creando preferencia MP: " + str(data))
+        return link, referencia
+    except Exception as e:
+        print("Error creando link de pago: " + str(e))
+        return None, None
+
+
+def mensaje_opciones_pago(link):
+    texto = "Puedes pagar de cualquiera de estas formas:\n\n"
+    if link:
+        texto += "💳 Tarjeta, PSE o Nequi por Mercado Pago (confirmacion automatica):\n" + link + "\n\n"
+    texto += ("📲 Nequi: 3057059517\n📲 Daviplata: 3057059517\n🏦 Llave: 3057059517 (David Olaya)\n\n"
+              "Si pagas directo por Nequi/Daviplata/Llave, envianos la foto del comprobante aqui 📸. "
+              "Si usas el link de Mercado Pago, lo confirmamos automaticamente.")
+    return texto
 
 
 def leer_comprobante(media_bytes, mime_type):
@@ -280,6 +341,7 @@ def resumen_diario():
             msg = ("📊 Resumen del dia " + hoy + "\n\n"
                    "Nuevos clientes: " + str(estadisticas_diarias.get("nuevos", 0)) + "\n"
                    "Cierres confirmados: " + str(estadisticas_diarias.get("cierres", 0)) + "\n"
+                   "Reservas pagadas (MP): " + str(estadisticas_diarias.get("reservas", 0)) + "\n"
                    "Pendientes actuales: " + str(pendientes))
             send_message(ADMIN_PHONE, msg)
             ultimo_envio = hoy
@@ -309,15 +371,11 @@ CONFIG_SECUNDARIA = "Una vez habilitemos tu cuenta, sigue estos pasos en tu cons
 
 ACTIVACION = "Sigue estos pasos en tu consola o PC:\n\n1 Ve a Agregar nuevo (como nueva cuenta)\n2 Selecciona Usar otro dispositivo\n3 Copia el codigo que aparece y envialo aqui\n\nNuestro asesor lo activara de inmediato! 🚀"
 
-APARTAR = "Sin problema! Aparta tu servicio pagando ahora.\n\nPago por Llave Breve Falabella al: 3057059517\n\nCuando hayas pagado, envianos el comprobante aqui 📸\nUn asesor confirmara tu reserva.\n\nCuando tengas tu consola lista te indicamos como activarlo 🎮"
-
-JUEGOS = "JUEGOS XBOX\n\n1 CODIGO (Economico)\nJuego desde Microsoft, para tu cuenta de por vida\n\n2 CUENTA PRINCIPAL (+ Economico)\nAcceso de por vida, sin iniciar sesion en otra cuenta\n\n3 CUENTA SECUNDARIA (++ Economico)\nAcceso de por vida, iniciando sesion en la cuenta del juego\n\n4 SECUNDARIA CON METODO (+++ Economico)\nAcceso de por vida con tutorial que compartimos\n\nQue juego buscas? Dinos el nombre 👇"
-
 SOPORTE = "SOPORTE\n\nUn asesor te atendera personalmente.\n\nEscribenos al: +57 322 908 2927 😊"
 
 CIERRE = "🎮 Con mucho gusto! Gracias a ti por confiar en Game Line Col 🙌\n\nCualquier cosa que necesites aqui estamos. Que disfrutes tu juego! 🚀"
 
-PAGO_OPCIONES = "Para terminar de confirmar tu activacion, realiza el pago por cualquiera de estas opciones:\n\n📲 Nequi: 3057059517\n📲 Daviplata: 3057059517\n🏦 Llave: 3057059517 (David Olaya)\n\nCuando hayas pagado, envianos la foto del comprobante aqui 📸"
+JUEGOS = "JUEGOS XBOX\n\n1 CODIGO (Economico)\nJuego desde Microsoft, para tu cuenta de por vida\n\n2 CUENTA PRINCIPAL (+ Economico)\nAcceso de por vida, sin iniciar sesion en otra cuenta\n\n3 CUENTA SECUNDARIA (++ Economico)\nAcceso de por vida, iniciando sesion en la cuenta del juego\n\n4 SECUNDARIA CON METODO (+++ Economico)\nAcceso de por vida con tutorial que compartimos\n\nQue juego buscas? Dinos el nombre 👇"
 
 PROMPT = "Eres GameBot de Game Line Col. Responde en espanol, amable y profesional. Si el cliente pregunta por un juego especifico termina con ALERTA_JUEGO:[nombre]. Si no puedes resolver algo termina con ALERTA_ASESOR. No inventes precios."
 
@@ -358,10 +416,20 @@ def webhook():
 
             if cliente_encontrado:
                 tipo_cuenta_c = conversaciones[cliente_encontrado].get("tipo_cuenta", "Principal")
+                meses_c = conversaciones[cliente_encontrado].get("meses", "1 mes")
                 config_c = CONFIG_PRINCIPAL if tipo_cuenta_c == "Principal" else CONFIG_SECUNDARIA
                 mensaje_activo = "✅ Tu cuenta ha sido activada en la consola! 🎮\n\nYa puedes empezar a jugar. Sigue estas instrucciones:\n\n" + config_c
                 send_message(cliente_encontrado, mensaje_activo)
-                send_message(cliente_encontrado, PAGO_OPCIONES)
+
+                monto_c = PRECIOS_GAMEPASS.get(meses_c)
+                link_c, referencia_c = (None, None)
+                if monto_c:
+                    link_c, referencia_c = crear_link_pago(cliente_encontrado, "Game Pass Ultimate " + tipo_cuenta_c + " - " + meses_c, monto_c)
+                if referencia_c:
+                    conversaciones[cliente_encontrado]["referencia_pago"] = referencia_c
+                    conversaciones[cliente_encontrado]["tipo_pago_pendiente"] = "final"
+                send_message(cliente_encontrado, "Para terminar de confirmar tu activacion:\n\n" + mensaje_opciones_pago(link_c))
+
                 conversaciones[cliente_encontrado]["estado"] = "esperando_pago_final"
                 send_message(ADMIN_PHONE, "✅ Configuracion y opciones de pago enviadas al cliente +" + cliente_encontrado)
                 registrar_cliente(cliente_encontrado, "Activacion confirmada", "Game Pass " + tipo_cuenta_c, "CUENTA ACTIVADA - Esperando pago")
@@ -508,7 +576,15 @@ def webhook():
                 send_message(ADMIN_PHONE, alerta)
             elif "2" in text or "no" in text_lower or "apartar" in text_lower:
                 conversaciones[phone]["estado"] = "esperando_comprobante"
-                send_message(phone, APARTAR)
+                monto_r = PRECIOS_GAMEPASS.get(meses)
+                link_r, referencia_r = (None, None)
+                if monto_r:
+                    link_r, referencia_r = crear_link_pago(phone, "Reserva Game Pass " + tipo_cuenta + " - " + meses, monto_r)
+                if referencia_r:
+                    conversaciones[phone]["referencia_pago"] = referencia_r
+                    conversaciones[phone]["tipo_pago_pendiente"] = "reserva"
+                mensaje_apartar = "Sin problema! Aparta tu servicio pagando ahora.\n\n" + mensaje_opciones_pago(link_r) + "\n\nCuando tengas tu consola lista te indicamos como activarlo 🎮"
+                send_message(phone, mensaje_apartar)
                 alerta = "CLIENTE QUIERE APARTAR Game Line Col\nCliente: +" + phone + "\nMeses: " + meses + "\nCuenta: " + tipo_cuenta + "\nEspera comprobante!"
                 send_message(ADMIN_PHONE, alerta)
                 registrar_cliente(phone, text, "Game Pass " + tipo_cuenta + " - " + meses, "Quiere apartar")
@@ -610,6 +686,52 @@ def webhook():
 
     except Exception as e:
         print("Error: " + str(e))
+    return jsonify({"status": "ok"}), 200
+
+
+@app.route("/mercadopago-webhook", methods=["POST", "GET"])
+def mercadopago_webhook():
+    try:
+        payment_id = request.args.get("id") or request.args.get("data.id")
+        topic = request.args.get("topic") or request.args.get("type")
+
+        if not payment_id:
+            body = request.get_json(silent=True) or {}
+            if body.get("type") == "payment":
+                payment_id = body.get("data", {}).get("id")
+                topic = "payment"
+
+        if topic == "payment" and payment_id:
+            headers = {"Authorization": "Bearer " + MP_ACCESS_TOKEN}
+            r = requests.get("https://api.mercadopago.com/v1/payments/" + str(payment_id), headers=headers, timeout=10)
+            pago = r.json()
+            estado_pago = pago.get("status")
+            referencia = pago.get("external_reference", "")
+            monto_pagado = pago.get("transaction_amount")
+
+            if estado_pago == "approved" and referencia:
+                phone_pagador = referencia.split("-")[0]
+                datos_cliente = conversaciones.get(phone_pagador)
+                if datos_cliente and datos_cliente.get("referencia_pago") == referencia and not datos_cliente.get("pago_mp_confirmado"):
+                    conversaciones[phone_pagador]["pago_mp_confirmado"] = True
+                    tipo_pago = datos_cliente.get("tipo_pago_pendiente")
+
+                    if tipo_pago == "reserva":
+                        conversaciones[phone_pagador]["estado"] = "esperando_codigo_apartado"
+                        send_message(phone_pagador, "✅ Pago de tu reserva confirmado automaticamente!\n\nCuando tengas tu consola disponible envianos el codigo de activacion aqui 🎮")
+                        etiqueta_mp = "RESERVA"
+                        registrar_evento_diario("reservas")
+                    else:
+                        conversaciones[phone_pagador]["compro"] = True
+                        conversaciones[phone_pagador]["estado"] = "pago_confirmado"
+                        send_message(phone_pagador, CIERRE)
+                        etiqueta_mp = "ACTIVACION FINAL"
+                        registrar_evento_diario("cierres")
+
+                    send_message(ADMIN_PHONE, "✅ Pago confirmado automaticamente por Mercado Pago (" + etiqueta_mp + ")\nCliente: +" + phone_pagador + "\nMonto: $" + str(monto_pagado))
+                    registrar_cliente(phone_pagador, "Pago Mercado Pago aprobado", "Pago automatico - " + etiqueta_mp, "PAGO CONFIRMADO MP")
+    except Exception as e:
+        print("Error webhook Mercado Pago: " + str(e))
     return jsonify({"status": "ok"}), 200
 
 
