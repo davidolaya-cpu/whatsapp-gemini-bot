@@ -250,7 +250,10 @@ def cargar_estados():
         for fila in filas[1:]:
             if len(fila) >= 2:
                 try:
-                    conversaciones[fila[0]] = json.loads(fila[1])
+                    datos = json.loads(fila[1])
+                    if datos.get("estado") == "pago_confirmado":
+                        continue  # ya cerrado, no hace falta tenerlo en memoria
+                    conversaciones[fila[0]] = datos
                     cargados += 1
                 except Exception:
                     continue
@@ -261,12 +264,15 @@ def cargar_estados():
 
 def guardar_estados_periodico():
     while True:
-        time.sleep(30)
+        time.sleep(60)
         try:
             service = get_sheets_service()
             filas = [["telefono", "json"]]
             for phone, datos in list(conversaciones.items()):
-                filas.append([phone, json.dumps(datos)])
+                if datos.get("estado") == "pago_confirmado":
+                    continue  # ya cerrado, no hace falta seguir persistiendolo
+                datos_reducidos = {k: v for k, v in datos.items() if k != "historial"}
+                filas.append([phone, json.dumps(datos_reducidos)])
             service.spreadsheets().values().clear(
                 spreadsheetId=SHEET_ID, range=ESTADOS_RANGE
             ).execute()
@@ -278,6 +284,25 @@ def guardar_estados_periodico():
             ).execute()
         except Exception as e:
             print("Error guardando estados: " + str(e))
+
+
+def limpiar_conversaciones_antiguas():
+    while True:
+        time.sleep(3600)
+        ahora = time.time()
+        eliminadas = 0
+        for phone in list(conversaciones.keys()):
+            datos = conversaciones[phone]
+            ultima = datos.get("ultima_interaccion", 0)
+            estado = datos.get("estado")
+            if estado == "pago_confirmado" and (ahora - ultima) >= 86400:
+                del conversaciones[phone]
+                eliminadas += 1
+            elif estado == "menu" and (ahora - ultima) >= (30 * 86400):
+                del conversaciones[phone]
+                eliminadas += 1
+        if eliminadas:
+            print("Limpieza de memoria: " + str(eliminadas) + " conversaciones antiguas eliminadas. Activas: " + str(len(conversaciones)))
 
 
 ESTADOS_PENDIENTES = ["activacion", "esperando_comprobante", "esperando_codigo_apartado",
@@ -354,6 +379,7 @@ threading.Thread(target=verificar_seguimientos, daemon=True).start()
 threading.Thread(target=verificar_inactivos, daemon=True).start()
 threading.Thread(target=resumen_diario, daemon=True).start()
 threading.Thread(target=guardar_estados_periodico, daemon=True).start()
+threading.Thread(target=limpiar_conversaciones_antiguas, daemon=True).start()
 
 BIENVENIDA = "🎮 Bienvenido a Game Line Col! 🎮\n\nSomos tu tienda de confianza para juegos y suscripciones Xbox.\n\nEn que te podemos ayudar?\n\n1 Game Pass Ultimate (Xbox y PC)\n2 Juegos Xbox\n3 Soporte\n\nResponde con el numero de tu opcion 😊"
 
