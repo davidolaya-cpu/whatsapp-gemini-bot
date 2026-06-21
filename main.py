@@ -65,6 +65,52 @@ def send_message(phone, message):
     return r.json()
 
 
+def reenviar_imagen(phone, media_id, caption=""):
+    url = "https://graph.facebook.com/v18.0/" + PHONE_NUMBER_ID + "/messages"
+    headers = {
+        "Authorization": "Bearer " + WHATSAPP_TOKEN,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": phone,
+        "type": "image",
+        "image": {"id": media_id}
+    }
+    if caption:
+        payload["image"]["caption"] = caption
+    r = requests.post(url, headers=headers, json=payload)
+    return r.json()
+
+
+def descargar_media(media_id):
+    url = "https://graph.facebook.com/v18.0/" + media_id
+    headers = {"Authorization": "Bearer " + WHATSAPP_TOKEN}
+    info = requests.get(url, headers=headers).json()
+    media_url = info.get("url")
+    mime_type = info.get("mime_type", "image/jpeg")
+    media_resp = requests.get(media_url, headers=headers)
+    return media_resp.content, mime_type
+
+
+def leer_comprobante(media_bytes, mime_type):
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash-lite",
+            contents=[
+                types.Part.from_bytes(data=media_bytes, mime_type=mime_type),
+                "Esta imagen es un comprobante de pago colombiano (Nequi, Daviplata o transferencia/llave "
+                "bancaria). Extrae y resume en espanol, en pocas lineas: monto pagado, fecha y hora si aparecen, "
+                "y el numero, cuenta o llave destino si aparece. Si la imagen no parece un comprobante de pago "
+                "o no logras leer algun dato, dilo claramente."
+            ]
+        )
+        return response.text.strip()
+    except Exception as e:
+        print("Error leyendo comprobante: " + str(e))
+        return "No pude leer el comprobante automaticamente, revisa la imagen manualmente."
+
+
 PALABRAS_COMUNES = ["gracias", "listo", "vale", "ok", "okay", "perfecto", "genial", "bueno",
                      "claro", "entendido", "excelente", "graciaz", "thanks", "dale", "bien"]
 
@@ -141,6 +187,8 @@ SOPORTE = "SOPORTE\n\nUn asesor te atendera personalmente.\n\nEscribenos al: +57
 
 CIERRE = "🎮 Con mucho gusto! Gracias a ti por confiar en Game Line Col 🙌\n\nCualquier cosa que necesites aqui estamos. Que disfrutes tu juego! 🚀"
 
+PAGO_OPCIONES = "Para terminar de confirmar tu activacion, realiza el pago por cualquiera de estas opciones:\n\n📲 Nequi: 3057059517\n📲 Daviplata: 3057059517\n🏦 Llave: 3057059517 (David Olaya)\n\nCuando hayas pagado, envianos la foto del comprobante aqui 📸"
+
 PROMPT = "Eres GameBot de Game Line Col. Responde en espanol, amable y profesional. Si el cliente pregunta por un juego especifico termina con ALERTA_JUEGO:[nombre]. Si no puedes resolver algo termina con ALERTA_ASESOR. No inventes precios."
 
 
@@ -161,12 +209,13 @@ def webhook():
         if "messages" not in value:
             return jsonify({"status": "ok"}), 200
         message = value["messages"][0]
-        if message.get("type") != "text":
+        msg_type = message.get("type")
+        if msg_type not in ("text", "image"):
             return jsonify({"status": "ok"}), 200
 
         phone = message["from"]
         msg_id = message.get("id", "")
-        text = message["text"]["body"].strip()
+        text = message["text"]["body"].strip() if msg_type == "text" else ""
         text_lower = text.lower()
 
         if phone == ADMIN_PHONE and text_lower.startswith("activo"):
@@ -182,10 +231,31 @@ def webhook():
                 config_c = CONFIG_PRINCIPAL if tipo_cuenta_c == "Principal" else CONFIG_SECUNDARIA
                 mensaje_activo = "✅ Tu cuenta ha sido activada en la consola! 🎮\n\nYa puedes empezar a jugar. Sigue estas instrucciones:\n\n" + config_c
                 send_message(cliente_encontrado, mensaje_activo)
-                send_message(ADMIN_PHONE, "✅ Confirmacion enviada al cliente +" + cliente_encontrado)
-                registrar_cliente(cliente_encontrado, "Activacion confirmada", "Game Pass " + tipo_cuenta_c, "CUENTA ACTIVADA")
+                send_message(cliente_encontrado, PAGO_OPCIONES)
+                conversaciones[cliente_encontrado]["estado"] = "esperando_pago_final"
+                send_message(ADMIN_PHONE, "✅ Configuracion y opciones de pago enviadas al cliente +" + cliente_encontrado)
+                registrar_cliente(cliente_encontrado, "Activacion confirmada", "Game Pass " + tipo_cuenta_c, "CUENTA ACTIVADA - Esperando pago")
             else:
                 send_message(ADMIN_PHONE, "No encontre un cliente pendiente con esos ultimos 4 digitos: " + ultimos_4)
+            return jsonify({"status": "ok"}), 200
+
+        if phone == ADMIN_PHONE and text_lower.startswith("pagook"):
+            ultimos_4 = text_lower.replace("pagook", "").strip()
+            cliente_encontrado = None
+            for ph, datos in conversaciones.items():
+                if ph.endswith(ultimos_4) and datos.get("estado") in ("esperando_pago_final", "pago_final_enviado"):
+                    cliente_encontrado = ph
+                    break
+
+            if cliente_encontrado:
+                tipo_cuenta_c = conversaciones[cliente_encontrado].get("tipo_cuenta", "No especificado")
+                meses_c = conversaciones[cliente_encontrado].get("meses", "No especificado")
+                conversaciones[cliente_encontrado]["estado"] = "pago_confirmado"
+                send_message(cliente_encontrado, CIERRE)
+                send_message(ADMIN_PHONE, "✅ Pago confirmado, mensaje de cierre enviado al cliente +" + cliente_encontrado)
+                registrar_cliente(cliente_encontrado, "Pago confirmado por admin", "Game Pass " + tipo_cuenta_c + " - " + meses_c, "PAGO CONFIRMADO - Cerrado")
+            else:
+                send_message(ADMIN_PHONE, "No encontre un cliente esperando confirmacion de pago con esos ultimos 4 digitos: " + ultimos_4)
             return jsonify({"status": "ok"}), 200
 
         saludos = ["hola", "buenas", "buenos dias", "buenas tardes", "buenas noches", "hi", "hello", "inicio"]
@@ -228,6 +298,35 @@ def webhook():
         historial = conversaciones[phone].get("historial", [])
         meses = conversaciones[phone].get("meses", "No especificado")
         tipo_cuenta = conversaciones[phone].get("tipo_cuenta", "No especificado")
+
+        if msg_type == "image":
+            if estado in ("esperando_comprobante", "esperando_pago_final"):
+                media_id = message["image"]["id"]
+                try:
+                    media_bytes, mime_type = descargar_media(media_id)
+                    analisis = leer_comprobante(media_bytes, mime_type)
+                except Exception as e:
+                    print("Error procesando imagen: " + str(e))
+                    analisis = "No pude leer el comprobante automaticamente, revisa la imagen manualmente."
+
+                if estado == "esperando_comprobante":
+                    conversaciones[phone]["estado"] = "esperando_codigo_apartado"
+                    send_message(phone, "Comprobante recibido! Un asesor confirmara tu reserva.\n\nCuando tengas tu consola disponible envianos el codigo de activacion aqui 🎮")
+                    etiqueta = "COMPROBANTE DE PAGO (Reserva)"
+                else:
+                    conversaciones[phone]["estado"] = "pago_final_enviado"
+                    send_message(phone, "Comprobante recibido! Un asesor confirmara tu pago en breve. Gracias por tu compra 🎮🙌")
+                    etiqueta = "COMPROBANTE DE PAGO (Activacion final)"
+
+                reenviar_imagen(ADMIN_PHONE, media_id)
+                alerta = (etiqueta + " Game Line Col\nCliente: +" + phone + "\nMeses: " + meses +
+                          "\nCuenta: " + tipo_cuenta + "\n\nLectura automatica:\n" + analisis +
+                          "\n\nConfirma el pago manualmente.")
+                send_message(ADMIN_PHONE, alerta)
+                registrar_cliente(phone, "Comprobante imagen", "Game Pass " + tipo_cuenta + " - " + meses, etiqueta)
+            else:
+                send_message(phone, "Recibimos tu imagen, pero en este momento no la necesitamos. Si tienes alguna duda escribenos 😊")
+            return jsonify({"status": "ok"}), 200
 
         if estado == "seleccion_meses":
             m = extraer_meses(text)
@@ -281,13 +380,11 @@ def webhook():
             return jsonify({"status": "ok"}), 200
 
         if estado == "esperando_comprobante":
-            meses = conversaciones[phone].get("meses", "No especificado")
-            tipo_cuenta = conversaciones[phone].get("tipo_cuenta", "No especificado")
-            conversaciones[phone]["estado"] = "esperando_codigo_apartado"
-            send_message(phone, "Comprobante recibido! Un asesor confirmara tu reserva.\n\nCuando tengas tu consola disponible envianos el codigo de activacion aqui 🎮")
-            alerta = "COMPROBANTE DE PAGO Game Line Col\nCliente: +" + phone + "\nMeses: " + meses + "\nCuenta: " + tipo_cuenta + "\nConfirma el pago!"
-            send_message(ADMIN_PHONE, alerta)
-            registrar_cliente(phone, "Comprobante enviado", "Game Pass " + tipo_cuenta + " - " + meses, "PAGO RECIBIDO")
+            send_message(phone, "Para confirmar tu reserva necesitamos la foto de tu comprobante de pago 📸")
+            return jsonify({"status": "ok"}), 200
+
+        if estado == "esperando_pago_final":
+            send_message(phone, "Para confirmar tu activacion necesitamos la foto de tu comprobante de pago 📸")
             return jsonify({"status": "ok"}), 200
 
         if estado == "esperando_codigo_apartado" and es_codigo_consola(text):
