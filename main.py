@@ -112,6 +112,74 @@ def reenviar_imagen(phone, media_id, caption="", intentos=2):
     return None
 
 
+def enviar_botones(phone, cuerpo, botones, intentos=3):
+    url = "https://graph.facebook.com/v18.0/" + PHONE_NUMBER_ID + "/messages"
+    headers = {
+        "Authorization": "Bearer " + WHATSAPP_TOKEN,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": phone,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": cuerpo},
+            "action": {
+                "buttons": [
+                    {"type": "reply", "reply": {"id": b["id"], "title": b["titulo"]}} for b in botones
+                ]
+            }
+        }
+    }
+    for intento in range(intentos):
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=10)
+            data = r.json()
+            if r.status_code < 400:
+                return data
+            print("Error enviando botones (intento " + str(intento + 1) + "): " + str(data))
+        except Exception as e:
+            print("Error enviando botones (intento " + str(intento + 1) + "): " + str(e))
+        time.sleep(2)
+    return send_message(phone, cuerpo)  # respaldo: si fallan los botones, manda texto plano
+
+
+def enviar_lista(phone, cuerpo, texto_boton, filas, titulo_seccion="Opciones", intentos=3):
+    url = "https://graph.facebook.com/v18.0/" + PHONE_NUMBER_ID + "/messages"
+    headers = {
+        "Authorization": "Bearer " + WHATSAPP_TOKEN,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": phone,
+        "type": "interactive",
+        "interactive": {
+            "type": "list",
+            "body": {"text": cuerpo},
+            "action": {
+                "button": texto_boton,
+                "sections": [{
+                    "title": titulo_seccion,
+                    "rows": [{"id": f["id"], "title": f["titulo"], "description": f.get("descripcion", "")} for f in filas]
+                }]
+            }
+        }
+    }
+    for intento in range(intentos):
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=10)
+            data = r.json()
+            if r.status_code < 400:
+                return data
+            print("Error enviando lista (intento " + str(intento + 1) + "): " + str(data))
+        except Exception as e:
+            print("Error enviando lista (intento " + str(intento + 1) + "): " + str(e))
+        time.sleep(2)
+    return send_message(phone, cuerpo)  # respaldo: si falla la lista, manda texto plano
+
+
 def descargar_media(media_id):
     url = "https://graph.facebook.com/v18.0/" + media_id
     headers = {"Authorization": "Bearer " + WHATSAPP_TOKEN}
@@ -381,15 +449,13 @@ threading.Thread(target=resumen_diario, daemon=True).start()
 threading.Thread(target=guardar_estados_periodico, daemon=True).start()
 threading.Thread(target=limpiar_conversaciones_antiguas, daemon=True).start()
 
-BIENVENIDA = "🎮 Bienvenido a Game Line Col! 🎮\n\nSomos tu tienda de confianza para juegos y suscripciones Xbox.\n\nEn que te podemos ayudar?\n\n1 Game Pass Ultimate (Xbox y PC)\n2 Juegos Xbox\n3 Soporte\n\nResponde con el numero de tu opcion 😊"
+BIENVENIDA = "🎮 Bienvenido a Game Line Col! 🎮\n\nSomos tu tienda de confianza para juegos y suscripciones Xbox.\n\nEn que te podemos ayudar? 👇"
 
-GAMEPASS = "🕹️ GAME PASS ULTIMATE\n\nPRECIOS:\n📅 1 mes: $29.900\n📅 2 meses: $55.000\n📅 3 meses: $80.000\n📅 6 meses: $140.000\n📅 12 meses: $190.000\n\nMODALIDADES:\n🏠 Principal: juegas desde tu cuenta sin iniciar sesion en otra\n👤 Secundaria: juegas desde tu cuenta iniciando sesion en la del servicio\n\nAmbas funcionan perfecto, solo cambia la configuracion.\n\nGARANTIA: Primero pruebas y luego pagas.\nPAGO: Llave Breve Falabella al 3057059517\n\nTe gustaria contratar? Responde SI 😊"
+GAMEPASS = "🕹️ GAME PASS ULTIMATE\n\nPRECIOS:\n📅 1 mes: $29.900\n📅 2 meses: $55.000\n📅 3 meses: $80.000\n📅 6 meses: $140.000\n📅 12 meses: $190.000\n\nMODALIDADES:\n🏠 Principal: juegas desde tu cuenta sin iniciar sesion en otra\n👤 Secundaria: juegas desde tu cuenta iniciando sesion en la del servicio\n\nAmbas funcionan perfecto, solo cambia la configuracion.\n\nGARANTIA: Primero pruebas y luego pagas."
 
-PREGUNTAR_MESES = "Por cuantos meses deseas contratar?\n\n📅 1 mes: $29.900\n📅 2 meses: $55.000\n📅 3 meses: $80.000\n📅 6 meses: $140.000\n📅 12 meses: $190.000\n\nResponde con el numero de meses"
+PREGUNTAR_CUENTA = "Que tipo de cuenta prefieres?\n\n🏠 Principal: Juegas desde tu cuenta sin iniciar sesion en otra\n👤 Secundaria: Juegas desde tu cuenta iniciando sesion en la del servicio\n\nAmbas funcionan perfecto 😊"
 
-PREGUNTAR_CUENTA = "Que tipo de cuenta prefieres?\n\n1 Cuenta Principal\n🏠 Juegas desde tu cuenta sin iniciar sesion en otra\n\n2 Cuenta Secundaria\n👤 Juegas desde tu cuenta iniciando sesion en la del servicio\n\nAmbas funcionan perfecto 😊"
-
-PREGUNTAR_CONSOLA = "Tienes tu consola o PC disponible ahora?\n\n1 Si, tengo consola disponible\n2 No, quiero apartar y activar despues"
+PREGUNTAR_CONSOLA = "Tienes tu consola o PC disponible ahora?"
 
 CONFIG_PRINCIPAL = "Una vez habilitemos tu cuenta, sigue estos pasos en tu consola:\n\nCONFIGURACION CUENTA PRINCIPAL\n\nCuando aparezcan las preguntas de asociacion Game Pass Ultimate:\n\n1 SIGUIENTE\n2 NO GRACIAS\n3 SIN BARRERAS\n4 OMITIR\n5 En la pregunta de hacer Xbox principal: HACER XBOX PRINCIPAL ✅\n\nIMPORTANTE:\nSiempre usa el servicio con la sesion de tu cuenta personal. La cuenta que anadimos nunca la inicies.\n\nEl uso es exclusivo para ti. Si compartes, se cancela sin devolucion del dinero."
 
@@ -404,6 +470,60 @@ CIERRE = "🎮 Con mucho gusto! Gracias a ti por confiar en Game Line Col 🙌\n
 JUEGOS = "JUEGOS XBOX\n\n1 CODIGO (Economico)\nJuego desde Microsoft, para tu cuenta de por vida\n\n2 CUENTA PRINCIPAL (+ Economico)\nAcceso de por vida, sin iniciar sesion en otra cuenta\n\n3 CUENTA SECUNDARIA (++ Economico)\nAcceso de por vida, iniciando sesion en la cuenta del juego\n\n4 SECUNDARIA CON METODO (+++ Economico)\nAcceso de por vida con tutorial que compartimos\n\nQue juego buscas? Dinos el nombre 👇"
 
 PROMPT = "Eres GameBot de Game Line Col. Responde en espanol, amable y profesional. Si el cliente pregunta por un juego especifico termina con ALERTA_JUEGO:[nombre]. Si no puedes resolver algo termina con ALERTA_ASESOR. No inventes precios."
+
+ESTADO_CLIENTE_MENSAJE = {
+    "menu": "Aun no has iniciado un pedido. Escribe 'hola' para ver el menu 🎮",
+    "gamepass": "Estas viendo la info de Game Pass Ultimate. Responde si quieres contratar 😊",
+    "seleccion_meses": "Estamos esperando que elijas el plan de meses.",
+    "seleccion_cuenta": "Estamos esperando que elijas el tipo de cuenta (Principal o Secundaria).",
+    "preguntar_consola": "Estamos esperando que nos digas si tienes tu consola disponible.",
+    "activacion": "Estamos esperando el codigo de activacion de tu consola. Envialo aqui cuando lo tengas 🎮",
+    "esperando_comprobante": "Estamos esperando el comprobante de pago de tu reserva 📸",
+    "esperando_codigo_apartado": "Tu reserva esta pagada ✅. Estamos esperando que nos envies el codigo de activacion cuando tengas tu consola disponible.",
+    "esperando_pago_final": "Tu cuenta ya esta activada 🎮. Estamos esperando el comprobante del pago final 📸",
+    "pago_final_enviado": "Recibimos tu comprobante de pago final, un asesor lo esta confirmando ⏳",
+    "pago_confirmado": "Tu pedido esta cerrado y confirmado. Gracias por tu compra! 🎮🙌",
+    "juegos": "Estamos esperando que nos digas el nombre del juego que buscas.",
+    "soporte": "Tu solicitud de soporte fue enviada, un asesor te contactara pronto 😊"
+}
+
+
+def enviar_menu_principal(phone):
+    enviar_botones(phone, "Elige una opcion:", [
+        {"id": "1", "titulo": "Game Pass Ultimate"},
+        {"id": "2", "titulo": "Juegos Xbox"},
+        {"id": "3", "titulo": "Soporte"}
+    ])
+
+
+def enviar_pregunta_contratar(phone):
+    enviar_botones(phone, "Te gustaria contratar?", [
+        {"id": "si", "titulo": "Sí, quiero 😊"}
+    ])
+
+
+def enviar_pregunta_meses(phone):
+    enviar_lista(phone, "Por cuantos meses deseas contratar?", "Ver planes", [
+        {"id": "1", "titulo": "1 mes", "descripcion": "$29.900"},
+        {"id": "2", "titulo": "2 meses", "descripcion": "$55.000"},
+        {"id": "3", "titulo": "3 meses", "descripcion": "$80.000"},
+        {"id": "6", "titulo": "6 meses", "descripcion": "$140.000"},
+        {"id": "12", "titulo": "12 meses", "descripcion": "$190.000"}
+    ], titulo_seccion="Planes Game Pass")
+
+
+def enviar_pregunta_cuenta(phone, prefijo=""):
+    enviar_botones(phone, prefijo + PREGUNTAR_CUENTA, [
+        {"id": "1", "titulo": "Cuenta Principal"},
+        {"id": "2", "titulo": "Cuenta Secundaria"}
+    ])
+
+
+def enviar_pregunta_consola(phone, prefijo=""):
+    enviar_botones(phone, prefijo + PREGUNTAR_CONSOLA, [
+        {"id": "1", "titulo": "Sí, tengo consola"},
+        {"id": "2", "titulo": "Quiero apartar"}
+    ])
 
 
 @app.route("/webhook", methods=["GET"])
@@ -424,12 +544,24 @@ def webhook():
             return jsonify({"status": "ok"}), 200
         message = value["messages"][0]
         msg_type = message.get("type")
-        if msg_type not in ("text", "image"):
+        if msg_type not in ("text", "image", "interactive"):
             return jsonify({"status": "ok"}), 200
 
         phone = message["from"]
         msg_id = message.get("id", "")
-        text = message["text"]["body"].strip() if msg_type == "text" else ""
+
+        if msg_type == "text":
+            text = message["text"]["body"].strip()
+        elif msg_type == "interactive":
+            interactive_data = message.get("interactive", {})
+            if interactive_data.get("type") == "button_reply":
+                text = interactive_data["button_reply"]["id"]
+            elif interactive_data.get("type") == "list_reply":
+                text = interactive_data["list_reply"]["id"]
+            else:
+                text = ""
+        else:
+            text = ""
         text_lower = text.lower()
 
         if phone == ADMIN_PHONE and text_lower.startswith("activo"):
@@ -524,12 +656,29 @@ def webhook():
             conversaciones[phone]["estado"] = "menu"
             conversaciones[phone]["ultima_interaccion"] = time.time()
             send_message(phone, BIENVENIDA)
+            enviar_menu_principal(phone)
             registrar_cliente(phone, text, "Inicio", "Bienvenida enviada")
             return jsonify({"status": "ok"}), 200
 
         if es_agradecimiento(text) and conversaciones[phone].get("compro"):
             conversaciones[phone]["ultima_interaccion"] = time.time()
             send_message(phone, CIERRE)
+            return jsonify({"status": "ok"}), 200
+
+        if text_lower == "estado":
+            estado_actual = conversaciones[phone].get("estado", "menu")
+            meses_e = conversaciones[phone].get("meses")
+            tipo_cuenta_e = conversaciones[phone].get("tipo_cuenta")
+            descripcion = ESTADO_CLIENTE_MENSAJE.get(estado_actual, "No tenemos un pedido activo en este momento. Escribe 'hola' para ver el menu 🎮")
+            msg = "📦 Estado de tu pedido:\n\n" + descripcion
+            detalle = []
+            if meses_e:
+                detalle.append("Plan: " + meses_e)
+            if tipo_cuenta_e:
+                detalle.append("Cuenta: " + tipo_cuenta_e)
+            if detalle:
+                msg += "\n\n" + "\n".join(detalle)
+            send_message(phone, msg)
             return jsonify({"status": "ok"}), 200
 
         conversaciones[phone]["ultima_interaccion"] = time.time()
@@ -574,22 +723,26 @@ def webhook():
             if m:
                 conversaciones[phone]["meses"] = m
                 conversaciones[phone]["estado"] = "seleccion_cuenta"
-                send_message(phone, "Seleccionaste " + m + ".\n\n" + PREGUNTAR_CUENTA)
+                send_message(phone, "Seleccionaste " + m + ".")
+                enviar_pregunta_cuenta(phone)
             else:
-                send_message(phone, "No entendi. Responde con: 1, 2, 3, 6 o 12")
+                send_message(phone, "No entendi cual plan elegiste 🙏")
+                enviar_pregunta_meses(phone)
             return jsonify({"status": "ok"}), 200
 
         if estado == "seleccion_cuenta":
             if "1" in text or "principal" in text_lower:
                 conversaciones[phone]["tipo_cuenta"] = "Principal"
                 conversaciones[phone]["estado"] = "preguntar_consola"
-                send_message(phone, "Elegiste Cuenta Principal!\n\n" + PREGUNTAR_CONSOLA)
+                send_message(phone, "Elegiste Cuenta Principal! 🏠")
+                enviar_pregunta_consola(phone)
             elif "2" in text or "secundaria" in text_lower:
                 conversaciones[phone]["tipo_cuenta"] = "Secundaria"
                 conversaciones[phone]["estado"] = "preguntar_consola"
-                send_message(phone, "Elegiste Cuenta Secundaria!\n\n" + PREGUNTAR_CONSOLA)
+                send_message(phone, "Elegiste Cuenta Secundaria! 👤")
+                enviar_pregunta_consola(phone)
             else:
-                send_message(phone, PREGUNTAR_CUENTA)
+                enviar_pregunta_cuenta(phone)
             return jsonify({"status": "ok"}), 200
 
         if estado == "preguntar_consola":
@@ -615,7 +768,7 @@ def webhook():
                 send_message(ADMIN_PHONE, alerta)
                 registrar_cliente(phone, text, "Game Pass " + tipo_cuenta + " - " + meses, "Quiere apartar")
             else:
-                send_message(phone, PREGUNTAR_CONSOLA)
+                enviar_pregunta_consola(phone)
             return jsonify({"status": "ok"}), 200
 
         if estado == "activacion" and es_codigo_consola(text):
@@ -649,6 +802,7 @@ def webhook():
         if text == "1" or ("game pass" in text_lower and estado == "menu"):
             conversaciones[phone]["estado"] = "gamepass"
             send_message(phone, GAMEPASS)
+            enviar_pregunta_contratar(phone)
             registrar_cliente(phone, text, "Game Pass Ultimate", "Consulto precios")
             return jsonify({"status": "ok"}), 200
 
@@ -668,7 +822,7 @@ def webhook():
 
         if estado == "gamepass" and text_lower in ["si", "sí", "yes", "quiero", "dale", "listo"]:
             conversaciones[phone]["estado"] = "seleccion_meses"
-            send_message(phone, PREGUNTAR_MESES)
+            enviar_pregunta_meses(phone)
             return jsonify({"status": "ok"}), 200
 
         if es_agradecimiento(text):
