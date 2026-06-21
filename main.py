@@ -23,7 +23,6 @@ MP_NOTIFICATION_URL = os.environ.get("MP_NOTIFICATION_URL")
 SHEET_ID = "1lvIlK1LYbT68HsuDTbMRzWSYh_RGUPHAZeV31_sAmdU"
 ADMIN_PHONE = "573229082927"
 HORA_SEGUIMIENTO = 3600
-HORA_SEGUIMIENTO_24H = 86400
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -80,6 +79,43 @@ def send_message(phone, message, intentos=3):
             print("WhatsApp error (intento " + str(intento + 1) + "): " + str(ultimo_resultado))
         except Exception as e:
             print("Error enviando mensaje (intento " + str(intento + 1) + "): " + str(e))
+        time.sleep(2)
+    return ultimo_resultado
+
+
+def enviar_template(phone, nombre_plantilla, idioma="es_CO", parametros=None, intentos=3):
+    # A diferencia de send_message, esto SI funciona aunque hayan pasado mas de 24h
+    # desde el ultimo mensaje del cliente, porque usa una plantilla pre-aprobada por Meta.
+    # 'parametros' es una lista de textos para llenar las variables {{1}}, {{2}}... del
+    # cuerpo de la plantilla (opcional, solo si la plantilla las tiene).
+    # Primero hay que crear la plantilla en el WhatsApp Manager de Meta y esperar su aprobacion.
+    url = "https://graph.facebook.com/v18.0/" + PHONE_NUMBER_ID + "/messages"
+    headers = {
+        "Authorization": "Bearer " + WHATSAPP_TOKEN,
+        "Content-Type": "application/json"
+    }
+    template_payload = {"name": nombre_plantilla, "language": {"code": idioma}}
+    if parametros:
+        template_payload["components"] = [{
+            "type": "body",
+            "parameters": [{"type": "text", "text": p} for p in parametros]
+        }]
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": phone,
+        "type": "template",
+        "template": template_payload
+    }
+    ultimo_resultado = None
+    for intento in range(intentos):
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=10)
+            ultimo_resultado = r.json()
+            if r.status_code < 400:
+                return ultimo_resultado
+            print("Error enviando plantilla (intento " + str(intento + 1) + "): " + str(ultimo_resultado))
+        except Exception as e:
+            print("Error enviando plantilla (intento " + str(intento + 1) + "): " + str(e))
         time.sleep(2)
     return ultimo_resultado
 
@@ -397,17 +433,15 @@ def verificar_seguimientos():
                 continue
             ultima = datos.get("ultima_interaccion", 0)
             recordatorio_enviado = datos.get("recordatorio_enviado", False)
-            recordatorio_24h_enviado = datos.get("recordatorio_24h_enviado", False)
             if not recordatorio_enviado and (ahora - ultima) >= HORA_SEGUIMIENTO:
                 msg = "Hola! Te escribimos desde Game Line Col 🎮\n\nNotamos que estuviste interesado en nuestros servicios.\n\nEn que te podemos ayudar?\n\n1 Game Pass Ultimate\n2 Juegos Xbox\n3 Soporte"
                 send_message(phone, msg)
                 conversaciones[phone]["recordatorio_enviado"] = True
                 registrar_cliente(phone, "Recordatorio", "Seguimiento", "Recordatorio enviado")
-            elif recordatorio_enviado and not recordatorio_24h_enviado and (ahora - ultima) >= HORA_SEGUIMIENTO_24H:
-                msg = "Hola de nuevo! 🎮 Tu oferta sigue disponible.\n\n🔥 Si confirmas hoy tienes 10% de descuento en cualquiera de nuestros servicios.\n\nEscribenos y te ayudamos enseguida!"
-                send_message(phone, msg)
-                conversaciones[phone]["recordatorio_24h_enviado"] = True
-                registrar_cliente(phone, "Recordatorio 24h", "Seguimiento", "Recordatorio 24h con descuento enviado")
+            # NOTA: no se agrega un recordatorio de 24h con texto libre porque WhatsApp
+            # ya cerro la ventana de conversacion gratuita a esa hora (solo 24h desde el
+            # ultimo mensaje del cliente). Para reactivar clientes despues de 24h hay que
+            # usar una PLANTILLA aprobada por Meta (ver enviar_template mas abajo).
 
 
 def verificar_inactivos():
