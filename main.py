@@ -518,7 +518,17 @@ ESTADO_CLIENTE_MENSAJE = {
     "pago_final_enviado": "Recibimos tu comprobante de pago final, un asesor lo esta confirmando ⏳",
     "pago_confirmado": "Tu pedido esta cerrado y confirmado. Gracias por tu compra! 🎮🙌",
     "juegos": "Estamos esperando que nos digas el nombre del juego que buscas.",
-    "soporte": "Tu solicitud de soporte fue enviada, un asesor te contactara pronto 😊"
+    "soporte": "Tu solicitud de soporte fue enviada, un asesor te contactara pronto 😊",
+    "soporte_menu": "Estas en el menu de soporte. Elige tu problema para continuar.",
+    "sop_online": "Estamos diagnosticando el problema de online. Elige el tipo de cuenta.",
+    "sop_online_p1": "Revisando Xbox Principal. Dinos el estado de la casilla.",
+    "sop_online_p2": "Aplicando solucion paso 1. Prueba el online y cuentanos como te fue.",
+    "sop_online_p3": "Aplicando solucion de facturacion. Prueba el online y cuentanos como te fue.",
+    "sop_online_s1": "Aplicando solucion de facturacion para cuenta Secundaria. Prueba y cuentanos.",
+    "sop_jugando": "Diagnosticando problema de otro usuario jugando. Elige el tipo de cuenta.",
+    "sop_jugando_p1": "Aplicando solucion para cuenta Principal. Prueba y cuentanos como te fue.",
+    "sop_jugando_s1": "Aplicando solucion para cuenta Secundaria. Prueba y cuentanos como te fue.",
+    "soporte_asesor": "Tu caso fue escalado a un asesor, te contactara en breve 🙏"
 }
 
 
@@ -846,12 +856,164 @@ def webhook():
             registrar_cliente(phone, text, "Juegos Xbox", "Consulto juegos")
             return jsonify({"status": "ok"}), 200
 
-        if text == "3" or "soporte" in text_lower:
-            conversaciones[phone]["estado"] = "soporte"
-            send_message(phone, SOPORTE)
-            registrar_cliente(phone, text, "Soporte", "Solicito soporte")
-            alerta = "SOPORTE Game Line Col\nCliente: +" + phone + " solicito soporte."
+        if text == "3" or "soporte" in text_lower or estado == "soporte_menu":
+            conversaciones[phone]["estado"] = "soporte_menu"
+            registrar_cliente(phone, text, "Soporte", "Entro al menu de soporte")
+            enviar_botones(phone, "🛠️ Soporte Game Line Col\n\nCual es el problema que tienes?", [
+                {"id": "sop_online", "titulo": "No funciona el online"},
+                {"id": "sop_jugando", "titulo": "Alguien más está jugando"},
+                {"id": "sop_password", "titulo": "La cuenta pide contraseña"}
+            ])
+            return jsonify({"status": "ok"}), 200
+
+        # ── SOPORTE: No funciona el online ──────────────────────────────────
+        if text == "sop_online":
+            conversaciones[phone]["estado"] = "sop_online"
+            enviar_botones(phone, "Que tipo de cuenta adquiriste?", [
+                {"id": "sop_online_p", "titulo": "Cuenta Principal"},
+                {"id": "sop_online_s", "titulo": "Cuenta Secundaria"}
+            ])
+            return jsonify({"status": "ok"}), 200
+
+        if text == "sop_online_p":
+            conversaciones[phone]["estado"] = "sop_online_p1"
+            send_message(phone,
+                "Vamos a verificar la configuracion de tu Xbox Principal 🎮\n\n"
+                "Sigue estos pasos *desde la cuenta de Game Pass* (no desde tu cuenta personal):\n\n"
+                "1️⃣ Ve a *Configuracion*\n"
+                "2️⃣ Luego a *Personalizacion*\n"
+                "3️⃣ Luego a *Xbox Principal*\n\n"
+                "Cuando estes ahi, dime: la casilla de Xbox Principal esta marcada o no?"
+            )
+            enviar_botones(phone, "Estado de la casilla Xbox Principal:", [
+                {"id": "sop_online_p_marcada", "titulo": "✅ Está marcada"},
+                {"id": "sop_online_p_no_marcada", "titulo": "❌ No está marcada"}
+            ])
+            return jsonify({"status": "ok"}), 200
+
+        if text in ("sop_online_p_marcada", "sop_online_p_no_marcada"):
+            conversaciones[phone]["estado"] = "sop_online_p2"
+            if text == "sop_online_p_marcada":
+                instruccion = "La casilla esta marcada. Haz lo siguiente:\n\n✅ *Desmarca* la casilla\n✅ *Vuelve a marcarla*"
+            else:
+                instruccion = "La casilla no estaba marcada. Haz lo siguiente:\n\n✅ *Marca* la casilla"
+            send_message(phone,
+                instruccion + "\n\n"
+                "Luego:\n"
+                "🔄 *Reinicia la consola*\n"
+                "⚠️ Al reiniciar, asegurate de tener *unicamente* iniciada sesion tu cuenta personal (cierra cualquier otra cuenta)\n\n"
+                "Vuelve a probar el online. Como te fue?"
+            )
+            enviar_botones(phone, "Resultado:", [
+                {"id": "sop_resuelto", "titulo": "🎉 Ya funciona!"},
+                {"id": "sop_online_p3", "titulo": "Sigue el error"}
+            ])
+            return jsonify({"status": "ok"}), 200
+
+        if text == "sop_online_p3":
+            conversaciones[phone]["estado"] = "sop_online_p3"
+            send_message(phone,
+                "Vamos con el siguiente paso. *Desde la cuenta de Game Pass* (no desde tu cuenta personal):\n\n"
+                "1️⃣ Ve a *Configuracion*\n"
+                "2️⃣ Luego a *Pago y facturacion*\n"
+                "3️⃣ Busca *Facturacion periodica*\n"
+                "4️⃣ Si esta *activa*, desactivala. Si esta *inactiva*, activala\n"
+                "5️⃣ Repite ese paso al menos *2 veces* (activar/desactivar/activar o viceversa)\n\n"
+                "Luego:\n"
+                "🔄 *Reinicia la consola*\n"
+                "⚠️ Al reiniciar, *solo* debe estar iniciada tu cuenta personal\n\n"
+                "Vuelve a probar. Como te fue?"
+            )
+            enviar_botones(phone, "Resultado:", [
+                {"id": "sop_resuelto", "titulo": "🎉 Ya funciona!"},
+                {"id": "sop_asesor", "titulo": "Sigue el error"}
+            ])
+            return jsonify({"status": "ok"}), 200
+
+        if text == "sop_online_s":
+            conversaciones[phone]["estado"] = "sop_online_s1"
+            send_message(phone,
+                "Para cuenta Secundaria vamos a ajustar la facturacion. "
+                "*Desde la cuenta de Game Pass* (no desde tu cuenta personal):\n\n"
+                "1️⃣ Ve a *Configuracion*\n"
+                "2️⃣ Luego a *Pago y facturacion*\n"
+                "3️⃣ Busca *Facturacion periodica*\n"
+                "4️⃣ Si esta *activa*, desactivala. Si esta *inactiva*, activala\n"
+                "5️⃣ Repite ese paso al menos *2 veces* (activar/desactivar/activar o viceversa)\n\n"
+                "Luego:\n"
+                "🔄 *Reinicia la consola*\n"
+                "⚠️ Al reiniciar, *solo* debe estar iniciada tu cuenta personal\n\n"
+                "Vuelve a probar. Como te fue?"
+            )
+            enviar_botones(phone, "Resultado:", [
+                {"id": "sop_resuelto", "titulo": "🎉 Ya funciona!"},
+                {"id": "sop_asesor", "titulo": "Sigue el error"}
+            ])
+            return jsonify({"status": "ok"}), 200
+
+        # ── SOPORTE: Alguien más está jugando ───────────────────────────────
+        if text == "sop_jugando":
+            conversaciones[phone]["estado"] = "sop_jugando"
+            enviar_botones(phone, "Que tipo de cuenta adquiriste?", [
+                {"id": "sop_jugando_p", "titulo": "Cuenta Principal"},
+                {"id": "sop_jugando_s", "titulo": "Cuenta Secundaria"}
+            ])
+            return jsonify({"status": "ok"}), 200
+
+        if text == "sop_jugando_p":
+            conversaciones[phone]["estado"] = "sop_jugando_p1"
+            send_message(phone,
+                "Para cuenta Principal el problema se soluciona cerrando la sesion de la cuenta de Game Pass 🎮\n\n"
+                "Haz esto en tu consola:\n\n"
+                "1️⃣ Ve a la cuenta de Game Pass\n"
+                "2️⃣ *Cierra sesion* completamente de esa cuenta\n"
+                "3️⃣ Asegurate de tener *unicamente* iniciada tu cuenta personal\n\n"
+                "Vuelve a probar. Como te fue?"
+            )
+            enviar_botones(phone, "Resultado:", [
+                {"id": "sop_resuelto", "titulo": "🎉 Ya funciona!"},
+                {"id": "sop_asesor", "titulo": "Sigue el error"}
+            ])
+            return jsonify({"status": "ok"}), 200
+
+        if text == "sop_jugando_s":
+            conversaciones[phone]["estado"] = "sop_jugando_s1"
+            send_message(phone,
+                "Para cuenta Secundaria hay que ajustar la configuracion. "
+                "*Desde la cuenta de Game Pass* (no desde tu cuenta personal):\n\n"
+                "1️⃣ Ve a *Configuracion*\n"
+                "2️⃣ Luego a *Personalizacion*\n"
+                "3️⃣ Luego a *Xbox Principal*\n"
+                "4️⃣ *Marca* la casilla de hacer Xbox Principal ✅\n\n"
+                "Luego:\n"
+                "🔄 *Reinicia la consola*\n"
+                "⚠️ Al reiniciar, *solo* debe estar iniciada tu cuenta personal\n\n"
+                "Vuelve a probar. Como te fue?"
+            )
+            enviar_botones(phone, "Resultado:", [
+                {"id": "sop_resuelto", "titulo": "🎉 Ya funciona!"},
+                {"id": "sop_asesor", "titulo": "Sigue el error"}
+            ])
+            return jsonify({"status": "ok"}), 200
+
+        # ── SOPORTE: Pide contraseña ─────────────────────────────────────────
+        if text == "sop_password":
+            text = "sop_asesor"  # cae directo al asesor
+
+        # ── SOPORTE: Resuelto / Escalar al asesor ───────────────────────────
+        if text == "sop_resuelto":
+            conversaciones[phone]["estado"] = "menu"
+            send_message(phone, "Perfecto! Nos alegra que haya quedado solucionado 🎮🙌\n\nSi necesitas algo mas, escribe *hola* y te ayudamos.")
+            return jsonify({"status": "ok"}), 200
+
+        if text == "sop_asesor":
+            conversaciones[phone]["estado"] = "soporte_asesor"
+            send_message(phone, "Entendido, vamos a pasarte con un asesor que te ayudara personalmente 🙏\n\nEn breve te contactamos.")
+            alerta = ("🛠️ SOPORTE - ESCALADO AL ASESOR\nCliente: +" + phone +
+                      "\nProblema: " + conversaciones[phone].get("estado", "desconocido") +
+                      "\nContactalo para ayudarlo manualmente.")
             send_message(ADMIN_PHONE, alerta)
+            registrar_cliente(phone, "Soporte escalado", "Soporte", "Escalado al asesor")
             return jsonify({"status": "ok"}), 200
 
         if estado == "gamepass" and text_lower in ["si", "sí", "yes", "quiero", "dale", "listo"]:
