@@ -915,8 +915,8 @@ def webhook():
                     "Cuando estes ahi, dime: la casilla de Xbox Principal esta marcada o no?"
                 )
                 enviar_botones(phone, "Estado de la casilla Xbox Principal:", [
-                    {"id": "sop_online_p_marcada", "titulo": "✅ Está marcada"},
-                    {"id": "sop_online_p_no_marcada", "titulo": "❌ No está marcada"}
+                    {"id": "sop_online_p_marcada", "titulo": "Sí, está marcada"},
+                    {"id": "sop_online_p_no_marcada", "titulo": "No está marcada"}
                 ])
                 return jsonify({"status": "ok"}), 200
 
@@ -1041,9 +1041,9 @@ def webhook():
 
             # Si esta en un estado de soporte pero no se reconocio el texto, reenviar menu
             enviar_botones(phone, "No te entendi bien 🙏 Cual es tu problema?", [
-                {"id": "sop_online", "titulo": "No funciona el online"},
-                {"id": "sop_jugando", "titulo": "Alguien más está jugando"},
-                {"id": "sop_password", "titulo": "La cuenta pide contraseña"}
+                {"id": "sop_online", "titulo": "Online no funciona"},
+                {"id": "sop_jugando", "titulo": "Alguien más jugando"},
+                {"id": "sop_password", "titulo": "Pide contraseña"}
             ])
             return jsonify({"status": "ok"}), 200
 
@@ -1052,9 +1052,9 @@ def webhook():
             conversaciones[phone]["estado"] = "soporte_menu"
             registrar_cliente(phone, text, "Soporte", "Entro al menu de soporte")
             enviar_botones(phone, "🛠️ Soporte Game Line Col\n\nCual es el problema que tienes?", [
-                {"id": "sop_online", "titulo": "No funciona el online"},
-                {"id": "sop_jugando", "titulo": "Alguien más está jugando"},
-                {"id": "sop_password", "titulo": "La cuenta pide contraseña"}
+                {"id": "sop_online", "titulo": "Online no funciona"},
+                {"id": "sop_jugando", "titulo": "Alguien más jugando"},
+                {"id": "sop_password", "titulo": "Pide contraseña"}
             ])
             return jsonify({"status": "ok"}), 200
 
