@@ -26,6 +26,8 @@ HORA_SEGUIMIENTO = 3600
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
+catalogo_media_id = None
+
 
 _sheets_service = None
 
@@ -40,6 +42,61 @@ def get_sheets_service():
         )
         _sheets_service = build("sheets", "v4", credentials=creds)
     return _sheets_service
+
+
+def asegurar_hoja(titulo):
+    try:
+        service = get_sheets_service()
+        body = {"requests": [{"addSheet": {"properties": {"title": titulo}}}]}
+        service.spreadsheets().batchUpdate(spreadsheetId=SHEET_ID, body=body).execute()
+        print("Hoja '" + titulo + "' creada")
+    except Exception:
+        pass  # ya existe
+
+
+def guardar_config(clave, valor):
+    try:
+        service = get_sheets_service()
+        asegurar_hoja("Config")
+        result = service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID, range="Config!A:B"
+        ).execute()
+        filas = result.get("values", [])
+        actualizado = False
+        for i, fila in enumerate(filas):
+            if len(fila) >= 1 and fila[0] == clave:
+                filas[i] = [clave, valor]
+                actualizado = True
+                break
+        if not actualizado:
+            filas.append([clave, valor])
+        service.spreadsheets().values().clear(
+            spreadsheetId=SHEET_ID, range="Config!A:B"
+        ).execute()
+        service.spreadsheets().values().update(
+            spreadsheetId=SHEET_ID,
+            range="Config!A1",
+            valueInputOption="RAW",
+            body={"values": filas}
+        ).execute()
+    except Exception as e:
+        print("Error guardando config: " + str(e))
+
+
+def cargar_config():
+    global catalogo_media_id
+    try:
+        service = get_sheets_service()
+        result = service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID, range="Config!A:B"
+        ).execute()
+        filas = result.get("values", [])
+        for fila in filas:
+            if len(fila) >= 2 and fila[0] == "catalogo_media_id":
+                catalogo_media_id = fila[1]
+                print("Catalogo cargado, media_id: " + catalogo_media_id)
+    except Exception as e:
+        print("Error cargando config: " + str(e))
 
 
 def registrar_cliente(phone, mensaje, servicio, estado):
@@ -216,6 +273,36 @@ def enviar_lista(phone, cuerpo, texto_boton, filas, titulo_seccion="Opciones", i
     return send_message(phone, cuerpo)  # respaldo: si falla la lista, manda texto plano
 
 
+def enviar_documento(phone, media_id, caption="", nombre_archivo="Catalogo_Game_Line_Col.pdf", intentos=3):
+    url = "https://graph.facebook.com/v18.0/" + PHONE_NUMBER_ID + "/messages"
+    headers = {
+        "Authorization": "Bearer " + WHATSAPP_TOKEN,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": phone,
+        "type": "document",
+        "document": {
+            "id": media_id,
+            "caption": caption,
+            "filename": nombre_archivo
+        }
+    }
+    for intento in range(intentos):
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=10)
+            data = r.json()
+            if r.status_code < 400:
+                return data
+            print("Error enviando documento (intento " + str(intento + 1) + "): " + str(data))
+        except Exception as e:
+            print("Error enviando documento (intento " + str(intento + 1) + "): " + str(e))
+        time.sleep(2)
+    send_message(phone, caption)
+    return None
+
+
 def descargar_media(media_id):
     url = "https://graph.facebook.com/v18.0/" + media_id
     headers = {"Authorization": "Bearer " + WHATSAPP_TOKEN}
@@ -332,15 +419,6 @@ def es_agradecimiento(texto):
 
 ESTADOS_RANGE = "Estados!A:B"
 
-
-def asegurar_hoja_estados():
-    try:
-        service = get_sheets_service()
-        body = {"requests": [{"addSheet": {"properties": {"title": "Estados"}}}]}
-        service.spreadsheets().batchUpdate(spreadsheetId=SHEET_ID, body=body).execute()
-        print("Hoja 'Estados' creada")
-    except Exception:
-        pass  # ya existe, no pasa nada
 
 
 def cargar_estados():
@@ -475,8 +553,10 @@ def resumen_diario():
 
 
 conversaciones = {}
-asegurar_hoja_estados()
+asegurar_hoja("Estados")
+asegurar_hoja("Config")
 cargar_estados()
+cargar_config()
 threading.Thread(target=verificar_seguimientos, daemon=True).start()
 threading.Thread(target=verificar_inactivos, daemon=True).start()
 threading.Thread(target=resumen_diario, daemon=True).start()
@@ -588,11 +668,26 @@ def webhook():
             return jsonify({"status": "ok"}), 200
         message = value["messages"][0]
         msg_type = message.get("type")
-        if msg_type not in ("text", "image", "interactive"):
+        if msg_type not in ("text", "image", "interactive", "document"):
             return jsonify({"status": "ok"}), 200
 
         phone = message["from"]
         msg_id = message.get("id", "")
+
+        # ── Comando setcatalogo: admin envía el PDF con caption "setcatalogo" ─
+        if msg_type == "document" and phone == ADMIN_PHONE:
+            caption_doc = message.get("document", {}).get("caption", "").lower().strip()
+            if "setcatalogo" in caption_doc:
+                global catalogo_media_id
+                catalogo_media_id = message["document"]["id"]
+                guardar_config("catalogo_media_id", catalogo_media_id)
+                send_message(ADMIN_PHONE, "✅ Catalogo actualizado correctamente! Ahora se enviara automaticamente a los clientes que pregunten por juegos 🎮")
+            else:
+                send_message(ADMIN_PHONE, "Documento recibido. Si quieres usarlo como catalogo, envialo de nuevo con el caption: setcatalogo")
+            return jsonify({"status": "ok"}), 200
+
+        if msg_type == "document":
+            return jsonify({"status": "ok"}), 200
 
         if msg_type == "text":
             text = message["text"]["body"].strip()
@@ -852,7 +947,14 @@ def webhook():
 
         if text == "2" or text_lower in ["juegos", "juego"]:
             conversaciones[phone]["estado"] = "juegos"
-            send_message(phone, JUEGOS)
+            if catalogo_media_id:
+                enviar_documento(phone, catalogo_media_id, "🎮 Catalogo Game Line Col - Juegos Xbox")
+                send_message(phone,
+                    "Ahi tienes nuestro catalogo completo con todos los juegos disponibles y sus precios 👆\n\n"
+                    "Dinos el nombre del juego que te interesa y te damos mas informacion 😊"
+                )
+            else:
+                send_message(phone, JUEGOS)
             registrar_cliente(phone, text, "Juegos Xbox", "Consulto juegos")
             return jsonify({"status": "ok"}), 200
 
