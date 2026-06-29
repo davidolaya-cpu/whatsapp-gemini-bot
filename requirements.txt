@@ -3,3 +3,5 @@ requests
 google-genai
 google-auth
 google-api-python-client
+gunicorn
+mercadopago
