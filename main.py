@@ -24,6 +24,9 @@ SHEET_ID = "1lvIlK1LYbT68HsuDTbMRzWSYh_RGUPHAZeV31_sAmdU"
 ADMIN_PHONE = "573229082927"
 HORA_SEGUIMIENTO = 3600
 
+_flood_control = {}  # {phone: ultimo_timestamp_procesado}
+_sheets_errores_consecutivos = 0
+
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 catalogo_media_id = None
@@ -99,19 +102,30 @@ def cargar_config():
         print("Error cargando config: " + str(e))
 
 
-def registrar_cliente(phone, mensaje, servicio, estado):
+def registrar_compra(phone, tipo_cuenta, meses):
+    global _sheets_errores_consecutivos
     try:
         service = get_sheets_service()
         fecha = datetime.now().strftime("%d/%m/%Y %H:%M")
-        valores = [[fecha, "+" + phone, mensaje, servicio, estado]]
+        valores = [["+" + phone, fecha, tipo_cuenta, meses]]
         service.spreadsheets().values().append(
             spreadsheetId=SHEET_ID,
-            range="A:E",
+            range="Compras!A:D",
             valueInputOption="RAW",
             body={"values": valores}
         ).execute()
+        _sheets_errores_consecutivos = 0
     except Exception as e:
+        _sheets_errores_consecutivos += 1
         print("Error Sheets: " + str(e))
+        if _sheets_errores_consecutivos == 3:
+            try:
+                send_message(ADMIN_PHONE,
+                    "⚠️ Alerta Game Line Col: el registro en Google Sheets ha fallado "
+                    "3 veces seguidas. Puede que el token o los permisos hayan vencido. "
+                    "Revisa las credenciales en Railway.")
+            except Exception:
+                pass
 
 
 def send_message(phone, message, intentos=3):
@@ -481,13 +495,12 @@ def scheduler():
                            "En que te podemos ayudar?\n\n1 Game Pass Ultimate\n2 Juegos Xbox\n3 Soporte")
                     send_message(phone, msg)
                     conversaciones[phone]["recordatorio_enviado"] = True
-                    registrar_cliente(phone, "Recordatorio", "Seguimiento", "Recordatorio enviado")
 
             # 2. Codigo pendiente sin activar (5 min)
             codigo = datos.get("codigo_pendiente")
             codigo_at = datos.get("codigo_pendiente_at")
             if codigo and codigo_at and not datos.get("codigo_recordatorio_enviado"):
-                if (ahora - codigo_at) >= 300:
+                if (ahora - codigo_at) >= 120:  # 2 minutos
                     meses = datos.get("meses", "No especificado")
                     tipo_cuenta = datos.get("tipo_cuenta", "No especificado")
                     send_message(phone,
@@ -573,8 +586,28 @@ def scheduler():
 conversaciones = {}
 asegurar_hoja("Estados")
 asegurar_hoja("Config")
+asegurar_hoja("Compras")
+
+def inicializar_compras():
+    try:
+        service = get_sheets_service()
+        result = service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID, range="Compras!A1:D1"
+        ).execute()
+        if not result.get("values"):
+            service.spreadsheets().values().update(
+                spreadsheetId=SHEET_ID,
+                range="Compras!A1",
+                valueInputOption="RAW",
+                body={"values": [["Teléfono", "Fecha de compra", "Tipo de cuenta", "Tiempo adquirido"]]}
+            ).execute()
+            print("Encabezados de Compras creados")
+    except Exception as e:
+        print("Error inicializando Compras: " + str(e))
+
 cargar_estados()
 cargar_config()
+inicializar_compras()
 threading.Thread(target=scheduler, daemon=True).start()
 
 BIENVENIDA = "🎮 Bienvenido a Game Line Col! 🎮\n\nSomos tu tienda de confianza para juegos y suscripciones Xbox.\n\nEn que te podemos ayudar? 👇"
@@ -688,6 +721,19 @@ def webhook():
         phone = message["from"]
         msg_id = message.get("id", "")
 
+        # ── Anti-flood: máximo 1 mensaje procesado cada 2 segundos por cliente ─
+        if phone != ADMIN_PHONE:
+            ahora_flood = time.time()
+            ultimo_flood = _flood_control.get(phone, 0)
+            if (ahora_flood - ultimo_flood) < 2:
+                return jsonify({"status": "ok"}), 200
+            _flood_control[phone] = ahora_flood
+            # Limpiar entradas viejas cada 100 mensajes para no acumular
+            if len(_flood_control) > 100:
+                hace_5min = ahora_flood - 300
+                for p in [k for k, v in _flood_control.items() if v < hace_5min]:
+                    del _flood_control[p]
+
         # ── Comando setcatalogo: admin envía el PDF con caption "setcatalogo" ─
         if msg_type == "document" and phone == ADMIN_PHONE:
             caption_doc = message.get("document", {}).get("caption", "").lower().strip()
@@ -718,7 +764,21 @@ def webhook():
         text_lower = text.lower()
 
         if phone == ADMIN_PHONE and text_lower.startswith("activo"):
-            ultimos_4 = text_lower.replace("activo", "").strip()
+            partes = text_lower.replace("activo", "").strip().split()
+            ultimos_4 = partes[0] if partes else ""
+            tipo_suffix = partes[1] if len(partes) > 1 else ""
+
+            if tipo_suffix == "p":
+                tipo_cuenta_elegida = "Principal"
+            elif tipo_suffix == "s":
+                tipo_cuenta_elegida = "Secundaria"
+            else:
+                send_message(ADMIN_PHONE,
+                    "Indica el tipo de cuenta:\n"
+                    "✅ activo " + ultimos_4 + " p → Principal\n"
+                    "✅ activo " + ultimos_4 + " s → Secundaria")
+                return jsonify({"status": "ok"}), 200
+
             cliente_encontrado = None
             for ph, datos in conversaciones.items():
                 if ph.endswith(ultimos_4) and datos.get("compro"):
@@ -726,16 +786,16 @@ def webhook():
                     break
 
             if cliente_encontrado:
-                tipo_cuenta_c = conversaciones[cliente_encontrado].get("tipo_cuenta", "Principal")
+                conversaciones[cliente_encontrado]["tipo_cuenta"] = tipo_cuenta_elegida
                 meses_c = conversaciones[cliente_encontrado].get("meses", "1 mes")
-                config_c = CONFIG_PRINCIPAL if tipo_cuenta_c == "Principal" else CONFIG_SECUNDARIA
+                config_c = CONFIG_PRINCIPAL if tipo_cuenta_elegida == "Principal" else CONFIG_SECUNDARIA
                 mensaje_activo = "✅ Tu cuenta ha sido activada en la consola! 🎮\n\nYa puedes empezar a jugar. Sigue estas instrucciones:\n\n" + config_c
                 send_message(cliente_encontrado, mensaje_activo)
 
                 monto_c = PRECIOS_GAMEPASS.get(meses_c)
                 link_c, referencia_c = (None, None)
                 if monto_c:
-                    link_c, referencia_c = crear_link_pago(cliente_encontrado, "Game Pass Ultimate " + tipo_cuenta_c + " - " + meses_c, monto_c)
+                    link_c, referencia_c = crear_link_pago(cliente_encontrado, "Game Pass Ultimate " + tipo_cuenta_elegida + " - " + meses_c, monto_c)
                 if referencia_c:
                     conversaciones[cliente_encontrado]["referencia_pago"] = referencia_c
                     conversaciones[cliente_encontrado]["tipo_pago_pendiente"] = "final"
@@ -745,8 +805,7 @@ def webhook():
                 conversaciones[cliente_encontrado]["codigo_pendiente"] = None
                 conversaciones[cliente_encontrado]["codigo_pendiente_at"] = None
                 conversaciones[cliente_encontrado]["codigo_recordatorio_enviado"] = True
-                send_message(ADMIN_PHONE, "✅ Configuracion y opciones de pago enviadas al cliente +" + cliente_encontrado)
-                registrar_cliente(cliente_encontrado, "Activacion confirmada", "Game Pass " + tipo_cuenta_c, "CUENTA ACTIVADA - Esperando pago")
+                send_message(ADMIN_PHONE, "✅ Configuracion " + tipo_cuenta_elegida + " y opciones de pago enviadas al cliente +" + cliente_encontrado)
             else:
                 send_message(ADMIN_PHONE, "No encontre un cliente pendiente con esos ultimos 4 digitos: " + ultimos_4)
             return jsonify({"status": "ok"}), 200
@@ -765,7 +824,7 @@ def webhook():
                 conversaciones[cliente_encontrado]["estado"] = "pago_confirmado"
                 send_message(cliente_encontrado, CIERRE)
                 send_message(ADMIN_PHONE, "✅ Pago confirmado, mensaje de cierre enviado al cliente +" + cliente_encontrado)
-                registrar_cliente(cliente_encontrado, "Pago confirmado por admin", "Game Pass " + tipo_cuenta_c + " - " + meses_c, "PAGO CONFIRMADO - Cerrado")
+                registrar_compra(cliente_encontrado, tipo_cuenta_c, meses_c)
                 registrar_evento_diario("cierres")
             else:
                 send_message(ADMIN_PHONE, "No encontre un cliente esperando confirmacion de pago con esos ultimos 4 digitos: " + ultimos_4)
@@ -813,7 +872,6 @@ def webhook():
             conversaciones[phone]["ultima_interaccion"] = time.time()
             send_message(phone, BIENVENIDA)
             enviar_menu_principal(phone)
-            registrar_cliente(phone, text, "Inicio", "Bienvenida enviada")
             return jsonify({"status": "ok"}), 200
 
         if es_agradecimiento(text) and conversaciones[phone].get("compro"):
@@ -869,7 +927,6 @@ def webhook():
                           "\nCuenta: " + tipo_cuenta + "\n\nLectura automatica:\n" + analisis +
                           "\n\nConfirma el pago manualmente.")
                 send_message(ADMIN_PHONE, alerta)
-                registrar_cliente(phone, "Comprobante imagen", "Game Pass " + tipo_cuenta + " - " + meses, etiqueta)
             else:
                 send_message(phone, "Recibimos tu imagen, pero en este momento no la necesitamos. Si tienes alguna duda escribenos 😊")
             return jsonify({"status": "ok"}), 200
@@ -878,36 +935,20 @@ def webhook():
             m = extraer_meses(text)
             if m:
                 conversaciones[phone]["meses"] = m
-                conversaciones[phone]["estado"] = "seleccion_cuenta"
-                send_message(phone, "Seleccionaste " + m + ".")
-                enviar_pregunta_cuenta(phone)
+                conversaciones[phone]["estado"] = "preguntar_consola"
+                send_message(phone, "Seleccionaste " + m + ". 🎮")
+                enviar_pregunta_consola(phone)
             else:
                 send_message(phone, "No entendi cual plan elegiste 🙏")
                 enviar_pregunta_meses(phone)
             return jsonify({"status": "ok"}), 200
 
-        if estado == "seleccion_cuenta":
-            if "1" in text or "principal" in text_lower:
-                conversaciones[phone]["tipo_cuenta"] = "Principal"
-                conversaciones[phone]["estado"] = "preguntar_consola"
-                send_message(phone, "Elegiste Cuenta Principal! 🏠")
-                enviar_pregunta_consola(phone)
-            elif "2" in text or "secundaria" in text_lower:
-                conversaciones[phone]["tipo_cuenta"] = "Secundaria"
-                conversaciones[phone]["estado"] = "preguntar_consola"
-                send_message(phone, "Elegiste Cuenta Secundaria! 👤")
-                enviar_pregunta_consola(phone)
-            else:
-                enviar_pregunta_cuenta(phone)
-            return jsonify({"status": "ok"}), 200
-
         if estado == "preguntar_consola":
             meses = conversaciones[phone].get("meses", "No especificado")
-            tipo_cuenta = conversaciones[phone].get("tipo_cuenta", "No especificado")
             if "1" in text or "si" in text_lower or "tengo" in text_lower:
                 conversaciones[phone]["estado"] = "activacion"
                 send_message(phone, ACTIVACION)
-                alerta = "NUEVO CLIENTE Game Line Col\nCliente: +" + phone + "\nMeses: " + meses + "\nCuenta: " + tipo_cuenta + "\nEspera codigo de activacion!"
+                alerta = "NUEVO CLIENTE Game Line Col\nCliente: +" + phone + "\nMeses: " + meses + "\nEspera codigo de activacion!"
                 send_message(ADMIN_PHONE, alerta)
             elif "2" in text or "no" in text_lower or "apartar" in text_lower:
                 conversaciones[phone]["estado"] = "esperando_comprobante"
@@ -922,22 +963,23 @@ def webhook():
                 send_message(phone, mensaje_apartar)
                 alerta = "CLIENTE QUIERE APARTAR Game Line Col\nCliente: +" + phone + "\nMeses: " + meses + "\nCuenta: " + tipo_cuenta + "\nEspera comprobante!"
                 send_message(ADMIN_PHONE, alerta)
-                registrar_cliente(phone, text, "Game Pass " + tipo_cuenta + " - " + meses, "Quiere apartar")
             else:
                 enviar_pregunta_consola(phone)
             return jsonify({"status": "ok"}), 200
 
         if estado == "activacion" and es_codigo_consola(text):
             meses = conversaciones[phone].get("meses", "No especificado")
-            tipo_cuenta = conversaciones[phone].get("tipo_cuenta", "No especificado")
             conversaciones[phone]["compro"] = True
             conversaciones[phone]["codigo_pendiente"] = text
             conversaciones[phone]["codigo_pendiente_at"] = time.time()
             conversaciones[phone]["codigo_recordatorio_enviado"] = False
             send_message(phone, "Codigo recibido! Nuestro asesor lo activara en breve. 🎮\n\nTe avisaremos cuando este lista la activacion.")
-            alerta = "CODIGO DE ACTIVACION Game Line Col\nCliente: +" + phone + "\nMeses: " + meses + "\nCuenta: " + tipo_cuenta + "\nCodigo: " + text + "\nActiva el servicio!\n\nPara confirmar al cliente responde: activo " + phone[-4:]
+            alerta = ("CODIGO DE ACTIVACION Game Line Col\n"
+                      "Cliente: +" + phone + "\nMeses: " + meses + "\nCodigo: " + text + "\n\n"
+                      "Para confirmar responde:\n"
+                      "✅ activo " + phone[-4:] + " p → Cuenta Principal\n"
+                      "✅ activo " + phone[-4:] + " s → Cuenta Secundaria")
             send_message(ADMIN_PHONE, alerta)
-            registrar_cliente(phone, "Codigo: " + text, "Game Pass " + tipo_cuenta + " - " + meses, "COMPRA CONFIRMADA - Pendiente activar")
             return jsonify({"status": "ok"}), 200
 
         if estado == "esperando_comprobante":
@@ -950,22 +992,23 @@ def webhook():
 
         if estado == "esperando_codigo_apartado" and es_codigo_consola(text):
             meses = conversaciones[phone].get("meses", "No especificado")
-            tipo_cuenta = conversaciones[phone].get("tipo_cuenta", "No especificado")
             conversaciones[phone]["compro"] = True
             conversaciones[phone]["codigo_pendiente"] = text
             conversaciones[phone]["codigo_pendiente_at"] = time.time()
             conversaciones[phone]["codigo_recordatorio_enviado"] = False
             send_message(phone, "Codigo recibido! Nuestro asesor lo activara en breve. 🎮\n\nTe avisaremos cuando este lista la activacion.")
-            alerta = "CODIGO ACTIVACION APARTADO Game Line Col\nCliente: +" + phone + "\nMeses: " + meses + "\nCuenta: " + tipo_cuenta + "\nCodigo: " + text + "\nActiva el servicio!\n\nPara confirmar al cliente responde: activo " + phone[-4:]
+            alerta = ("CODIGO ACTIVACION APARTADO Game Line Col\n"
+                      "Cliente: +" + phone + "\nMeses: " + meses + "\nCodigo: " + text + "\n\n"
+                      "Para confirmar responde:\n"
+                      "✅ activo " + phone[-4:] + " p → Cuenta Principal\n"
+                      "✅ activo " + phone[-4:] + " s → Cuenta Secundaria")
             send_message(ADMIN_PHONE, alerta)
-            registrar_cliente(phone, "Codigo: " + text, "Game Pass " + tipo_cuenta + " - " + meses, "CODIGO RECIBIDO - Pendiente activar")
             return jsonify({"status": "ok"}), 200
 
         if text == "1" or ("game pass" in text_lower and estado == "menu"):
             conversaciones[phone]["estado"] = "gamepass"
             send_message(phone, GAMEPASS)
             enviar_pregunta_contratar(phone)
-            registrar_cliente(phone, text, "Game Pass Ultimate", "Consulto precios")
             return jsonify({"status": "ok"}), 200
 
         if text == "2" or text_lower in ["juegos", "juego"]:
@@ -978,7 +1021,6 @@ def webhook():
                 )
             else:
                 send_message(phone, JUEGOS)
-            registrar_cliente(phone, text, "Juegos Xbox", "Consulto juegos")
             return jsonify({"status": "ok"}), 200
 
         # ── SOPORTE: botones sop_* (se procesan ANTES que el menú principal) ─
@@ -1156,7 +1198,6 @@ def webhook():
                           "\nUltimo estado: " + estado_desc +
                           "\nContactalo para ayudarlo manualmente.")
                 send_message(ADMIN_PHONE, alerta)
-                registrar_cliente(phone, "Soporte escalado", "Soporte", "Escalado al asesor")
                 return jsonify({"status": "ok"}), 200
 
             if text == "sop_resuelto":
@@ -1175,7 +1216,6 @@ def webhook():
         # ── Menú principal soporte (opcion 3 o texto "soporte") ─────────────
         if text == "3" or "soporte" in text_lower:
             conversaciones[phone]["estado"] = "soporte_menu"
-            registrar_cliente(phone, text, "Soporte", "Entro al menu de soporte")
             enviar_botones(phone, "🛠️ Soporte Game Line Col\n\nCual es el problema que tienes?", [
                 {"id": "sop_online", "titulo": "Online no funciona"},
                 {"id": "sop_jugando", "titulo": "Alguien más jugando"},
@@ -1212,16 +1252,12 @@ def webhook():
             nombre_juego = match.group(1).strip() if match else text
             reply = re.sub(r'ALERTA_JUEGO:[^\n]+', '', reply).strip()
             conversaciones[phone]["compro"] = True
-            registrar_cliente(phone, text, "Juego: " + nombre_juego, "Cotizacion solicitada")
             alerta = "COTIZACION Game Line Col\nCliente: +" + phone + "\nJuego: " + nombre_juego
             send_message(ADMIN_PHONE, alerta)
         elif "ALERTA_ASESOR" in reply:
             reply = reply.replace("ALERTA_ASESOR", "").strip()
-            registrar_cliente(phone, text, "Consulta", "Necesita asesor")
             alerta = "ALERTA ASESOR Game Line Col\nCliente: +" + phone + "\nPregunta: " + text
             send_message(ADMIN_PHONE, alerta)
-        else:
-            registrar_cliente(phone, text, "Consulta", "Respondido por bot")
 
         historial.append({"role": "assistant", "content": reply})
         conversaciones[phone]["historial"] = historial[-20:]
@@ -1269,10 +1305,12 @@ def mercadopago_webhook():
                         conversaciones[phone_pagador]["estado"] = "pago_confirmado"
                         send_message(phone_pagador, CIERRE)
                         etiqueta_mp = "ACTIVACION FINAL"
+                        tipo_cuenta_mp = datos_cliente.get("tipo_cuenta", "No especificado")
+                        meses_mp = datos_cliente.get("meses", "No especificado")
+                        registrar_compra(phone_pagador, tipo_cuenta_mp, meses_mp)
                         registrar_evento_diario("cierres")
 
                     send_message(ADMIN_PHONE, "✅ Pago confirmado automaticamente por Mercado Pago (" + etiqueta_mp + ")\nCliente: +" + phone_pagador + "\nMonto: $" + str(monto_pagado))
-                    registrar_cliente(phone_pagador, "Pago Mercado Pago aprobado", "Pago automatico - " + etiqueta_mp, "PAGO CONFIRMADO MP")
     except Exception as e:
         print("Error webhook Mercado Pago: " + str(e))
     return jsonify({"status": "ok"}), 200
