@@ -444,49 +444,6 @@ def cargar_estados():
         print("Error cargando estados: " + str(e))
 
 
-def guardar_estados_periodico():
-    while True:
-        time.sleep(60)
-        try:
-            service = get_sheets_service()
-            filas = [["telefono", "json"]]
-            for phone, datos in list(conversaciones.items()):
-                if datos.get("estado") == "pago_confirmado":
-                    continue  # ya cerrado, no hace falta seguir persistiendolo
-                datos_reducidos = {k: v for k, v in datos.items() if k != "historial"}
-                filas.append([phone, json.dumps(datos_reducidos)])
-            service.spreadsheets().values().clear(
-                spreadsheetId=SHEET_ID, range=ESTADOS_RANGE
-            ).execute()
-            service.spreadsheets().values().update(
-                spreadsheetId=SHEET_ID,
-                range="Estados!A1",
-                valueInputOption="RAW",
-                body={"values": filas}
-            ).execute()
-        except Exception as e:
-            print("Error guardando estados: " + str(e))
-
-
-def limpiar_conversaciones_antiguas():
-    while True:
-        time.sleep(3600)
-        ahora = time.time()
-        eliminadas = 0
-        for phone in list(conversaciones.keys()):
-            datos = conversaciones[phone]
-            ultima = datos.get("ultima_interaccion", 0)
-            estado = datos.get("estado")
-            if estado == "pago_confirmado" and (ahora - ultima) >= 86400:
-                del conversaciones[phone]
-                eliminadas += 1
-            elif estado == "menu" and (ahora - ultima) >= (30 * 86400):
-                del conversaciones[phone]
-                eliminadas += 1
-        if eliminadas:
-            print("Limpieza de memoria: " + str(eliminadas) + " conversaciones antiguas eliminadas. Activas: " + str(len(conversaciones)))
-
-
 ESTADOS_PENDIENTES = ["activacion", "esperando_comprobante", "esperando_codigo_apartado",
                       "esperando_pago_final", "pago_final_enviado"]
 
@@ -502,54 +459,115 @@ def registrar_evento_diario(tipo):
     estadisticas_diarias[tipo] = estadisticas_diarias.get(tipo, 0) + 1
 
 
-def verificar_seguimientos():
+def scheduler():
+    ultimo_resumen = None
+    ultimo_guardado = 0
+    ultima_limpieza = 0
+
     while True:
         time.sleep(60)
         ahora = time.time()
+        hora_actual = datetime.now()
+
         for phone, datos in list(conversaciones.items()):
-            if datos.get("compro"):
-                continue
+            estado = datos.get("estado")
             ultima = datos.get("ultima_interaccion", 0)
-            recordatorio_enviado = datos.get("recordatorio_enviado", False)
-            if not recordatorio_enviado and (ahora - ultima) >= HORA_SEGUIMIENTO:
-                msg = "Hola! Te escribimos desde Game Line Col 🎮\n\nNotamos que estuviste interesado en nuestros servicios.\n\nEn que te podemos ayudar?\n\n1 Game Pass Ultimate\n2 Juegos Xbox\n3 Soporte"
-                send_message(phone, msg)
-                conversaciones[phone]["recordatorio_enviado"] = True
-                registrar_cliente(phone, "Recordatorio", "Seguimiento", "Recordatorio enviado")
-            # NOTA: no se agrega un recordatorio de 24h con texto libre porque WhatsApp
-            # ya cerro la ventana de conversacion gratuita a esa hora (solo 24h desde el
-            # ultimo mensaje del cliente). Para reactivar clientes despues de 24h hay que
-            # usar una PLANTILLA aprobada por Meta (ver enviar_template mas abajo).
 
+            # 1. Recordatorio de seguimiento (1h sin respuesta, no ha comprado)
+            if not datos.get("compro") and not datos.get("recordatorio_enviado"):
+                if (ahora - ultima) >= HORA_SEGUIMIENTO:
+                    msg = ("Hola! Te escribimos desde Game Line Col 🎮\n\n"
+                           "Notamos que estuviste interesado en nuestros servicios.\n\n"
+                           "En que te podemos ayudar?\n\n1 Game Pass Ultimate\n2 Juegos Xbox\n3 Soporte")
+                    send_message(phone, msg)
+                    conversaciones[phone]["recordatorio_enviado"] = True
+                    registrar_cliente(phone, "Recordatorio", "Seguimiento", "Recordatorio enviado")
 
-def verificar_inactivos():
-    while True:
-        time.sleep(300)
-        ahora = time.time()
-        for phone, datos in list(conversaciones.items()):
-            if datos.get("estado") == "esperando_pago_final" and not datos.get("alerta_inactividad_enviada"):
-                ultima = datos.get("ultima_interaccion", 0)
+            # 2. Codigo pendiente sin activar (5 min)
+            codigo = datos.get("codigo_pendiente")
+            codigo_at = datos.get("codigo_pendiente_at")
+            if codigo and codigo_at and not datos.get("codigo_recordatorio_enviado"):
+                if (ahora - codigo_at) >= 300:
+                    meses = datos.get("meses", "No especificado")
+                    tipo_cuenta = datos.get("tipo_cuenta", "No especificado")
+                    send_message(phone,
+                        "Hola! Los codigos de activacion de Xbox expiran en pocos minutos 🎮\n\n"
+                        "Por favor genera un nuevo codigo en tu consola:\n\n"
+                        "1️⃣ Ve a Agregar nuevo (como nueva cuenta)\n"
+                        "2️⃣ Selecciona Usar otro dispositivo\n"
+                        "3️⃣ Copia el nuevo codigo que aparece y envialo aqui 📲"
+                    )
+                    send_message(ADMIN_PHONE,
+                        "⏰ CODIGO VENCIDO - Game Line Col\nCliente: +" + phone +
+                        "\nMeses: " + meses + "\nCuenta: " + tipo_cuenta +
+                        "\nCodigo anterior: " + codigo +
+                        "\nEl cliente va a generar un nuevo codigo, espera el nuevo."
+                    )
+                    conversaciones[phone]["codigo_recordatorio_enviado"] = True
+                    conversaciones[phone]["codigo_pendiente"] = None
+                    conversaciones[phone]["codigo_pendiente_at"] = None
+
+            # 3. Alerta pago final inactivo (24h)
+            if estado == "esperando_pago_final" and not datos.get("alerta_inactividad_enviada"):
                 if (ahora - ultima) >= 86400:
-                    msg = "⚠️ Cliente +" + phone + " lleva mas de 24h sin enviar el comprobante del pago final. Quizas valga la pena escribirle."
-                    send_message(ADMIN_PHONE, msg)
+                    send_message(ADMIN_PHONE,
+                        "⚠️ Cliente +" + phone + " lleva mas de 24h sin enviar "
+                        "el comprobante del pago final. Quizas valga la pena escribirle."
+                    )
                     conversaciones[phone]["alerta_inactividad_enviada"] = True
 
-
-def resumen_diario():
-    ultimo_envio = None
-    while True:
-        time.sleep(60)
-        ahora = datetime.now()
-        hoy = ahora.strftime("%d/%m/%Y")
-        if ahora.hour == 21 and ultimo_envio != hoy:
+        # 4. Resumen diario a las 9pm
+        hoy = hora_actual.strftime("%d/%m/%Y")
+        if hora_actual.hour == 21 and ultimo_resumen != hoy:
             pendientes = sum(1 for d in conversaciones.values() if d.get("estado") in ESTADOS_PENDIENTES)
-            msg = ("📊 Resumen del dia " + hoy + "\n\n"
-                   "Nuevos clientes: " + str(estadisticas_diarias.get("nuevos", 0)) + "\n"
-                   "Cierres confirmados: " + str(estadisticas_diarias.get("cierres", 0)) + "\n"
-                   "Reservas pagadas (MP): " + str(estadisticas_diarias.get("reservas", 0)) + "\n"
-                   "Pendientes actuales: " + str(pendientes))
-            send_message(ADMIN_PHONE, msg)
-            ultimo_envio = hoy
+            send_message(ADMIN_PHONE,
+                "📊 Resumen del dia " + hoy + "\n\n"
+                "Nuevos clientes: " + str(estadisticas_diarias.get("nuevos", 0)) + "\n"
+                "Cierres confirmados: " + str(estadisticas_diarias.get("cierres", 0)) + "\n"
+                "Reservas pagadas (MP): " + str(estadisticas_diarias.get("reservas", 0)) + "\n"
+                "Pendientes actuales: " + str(pendientes)
+            )
+            ultimo_resumen = hoy
+
+        # 5. Guardar estados cada 5 minutos
+        if (ahora - ultimo_guardado) >= 300:
+            try:
+                service = get_sheets_service()
+                filas = [["telefono", "json"]]
+                for phone, datos in list(conversaciones.items()):
+                    if datos.get("estado") == "pago_confirmado":
+                        continue
+                    datos_reducidos = {k: v for k, v in datos.items() if k != "historial"}
+                    filas.append([phone, json.dumps(datos_reducidos)])
+                service.spreadsheets().values().clear(
+                    spreadsheetId=SHEET_ID, range=ESTADOS_RANGE
+                ).execute()
+                service.spreadsheets().values().update(
+                    spreadsheetId=SHEET_ID,
+                    range="Estados!A1",
+                    valueInputOption="RAW",
+                    body={"values": filas}
+                ).execute()
+                ultimo_guardado = ahora
+            except Exception as e:
+                print("Error guardando estados: " + str(e))
+
+        # 6. Limpieza de memoria cada hora
+        if (ahora - ultima_limpieza) >= 3600:
+            eliminadas = 0
+            for phone in list(conversaciones.keys()):
+                datos = conversaciones[phone]
+                ult = datos.get("ultima_interaccion", 0)
+                est = datos.get("estado")
+                if est == "pago_confirmado" and (ahora - ult) >= 86400:
+                    del conversaciones[phone]
+                    eliminadas += 1
+                elif est == "menu" and (ahora - ult) >= (30 * 86400):
+                    del conversaciones[phone]
+                    eliminadas += 1
+            if eliminadas:
+                print("Limpieza: " + str(eliminadas) + " conversaciones eliminadas. Activas: " + str(len(conversaciones)))
+            ultima_limpieza = ahora
 
 
 conversaciones = {}
@@ -557,11 +575,7 @@ asegurar_hoja("Estados")
 asegurar_hoja("Config")
 cargar_estados()
 cargar_config()
-threading.Thread(target=verificar_seguimientos, daemon=True).start()
-threading.Thread(target=verificar_inactivos, daemon=True).start()
-threading.Thread(target=resumen_diario, daemon=True).start()
-threading.Thread(target=guardar_estados_periodico, daemon=True).start()
-threading.Thread(target=limpiar_conversaciones_antiguas, daemon=True).start()
+threading.Thread(target=scheduler, daemon=True).start()
 
 BIENVENIDA = "🎮 Bienvenido a Game Line Col! 🎮\n\nSomos tu tienda de confianza para juegos y suscripciones Xbox.\n\nEn que te podemos ayudar? 👇"
 
@@ -728,6 +742,9 @@ def webhook():
                 send_message(cliente_encontrado, "Para terminar de confirmar tu activacion:\n\n" + mensaje_opciones_pago(link_c))
 
                 conversaciones[cliente_encontrado]["estado"] = "esperando_pago_final"
+                conversaciones[cliente_encontrado]["codigo_pendiente"] = None
+                conversaciones[cliente_encontrado]["codigo_pendiente_at"] = None
+                conversaciones[cliente_encontrado]["codigo_recordatorio_enviado"] = True
                 send_message(ADMIN_PHONE, "✅ Configuracion y opciones de pago enviadas al cliente +" + cliente_encontrado)
                 registrar_cliente(cliente_encontrado, "Activacion confirmada", "Game Pass " + tipo_cuenta_c, "CUENTA ACTIVADA - Esperando pago")
             else:
@@ -914,6 +931,9 @@ def webhook():
             meses = conversaciones[phone].get("meses", "No especificado")
             tipo_cuenta = conversaciones[phone].get("tipo_cuenta", "No especificado")
             conversaciones[phone]["compro"] = True
+            conversaciones[phone]["codigo_pendiente"] = text
+            conversaciones[phone]["codigo_pendiente_at"] = time.time()
+            conversaciones[phone]["codigo_recordatorio_enviado"] = False
             send_message(phone, "Codigo recibido! Nuestro asesor lo activara en breve. 🎮\n\nTe avisaremos cuando este lista la activacion.")
             alerta = "CODIGO DE ACTIVACION Game Line Col\nCliente: +" + phone + "\nMeses: " + meses + "\nCuenta: " + tipo_cuenta + "\nCodigo: " + text + "\nActiva el servicio!\n\nPara confirmar al cliente responde: activo " + phone[-4:]
             send_message(ADMIN_PHONE, alerta)
@@ -932,6 +952,9 @@ def webhook():
             meses = conversaciones[phone].get("meses", "No especificado")
             tipo_cuenta = conversaciones[phone].get("tipo_cuenta", "No especificado")
             conversaciones[phone]["compro"] = True
+            conversaciones[phone]["codigo_pendiente"] = text
+            conversaciones[phone]["codigo_pendiente_at"] = time.time()
+            conversaciones[phone]["codigo_recordatorio_enviado"] = False
             send_message(phone, "Codigo recibido! Nuestro asesor lo activara en breve. 🎮\n\nTe avisaremos cuando este lista la activacion.")
             alerta = "CODIGO ACTIVACION APARTADO Game Line Col\nCliente: +" + phone + "\nMeses: " + meses + "\nCuenta: " + tipo_cuenta + "\nCodigo: " + text + "\nActiva el servicio!\n\nPara confirmar al cliente responde: activo " + phone[-4:]
             send_message(ADMIN_PHONE, alerta)
