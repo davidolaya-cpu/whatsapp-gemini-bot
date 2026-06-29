@@ -30,6 +30,26 @@ _sheets_errores_consecutivos = 0
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 catalogo_media_id = None
+renovaciones = {}  # {phone: {vencimiento, tipo_cuenta, meses, notificado}}
+
+MESES_A_DIAS = {
+    "1 mes": 30, "2 meses": 60, "3 meses": 90,
+    "6 meses": 180, "12 meses": 365
+}
+
+
+def parsear_tiempo_minutos(texto):
+    texto = texto.lower().strip()
+    match = re.search(r'(\d+)\s*(min|hora|h\b)', texto)
+    if match:
+        cantidad = int(match.group(1))
+        unidad = match.group(2)
+        return cantidad * 60 if ("hora" in unidad or unidad == "h") else cantidad
+    if "media hora" in texto:
+        return 30
+    if "una hora" in texto:
+        return 60
+    return 30  # default
 
 
 _sheets_service = None
@@ -102,6 +122,53 @@ def cargar_config():
         print("Error cargando config: " + str(e))
 
 
+def guardar_renovaciones():
+    try:
+        service = get_sheets_service()
+        filas = [["telefono", "vencimiento", "tipo_cuenta", "meses", "notificado"]]
+        for ph, datos in renovaciones.items():
+            filas.append([
+                ph,
+                str(datos.get("vencimiento", 0)),
+                datos.get("tipo_cuenta", ""),
+                datos.get("meses", ""),
+                str(datos.get("notificado", False))
+            ])
+        service.spreadsheets().values().clear(
+            spreadsheetId=SHEET_ID, range="Renovaciones!A:E"
+        ).execute()
+        service.spreadsheets().values().update(
+            spreadsheetId=SHEET_ID,
+            range="Renovaciones!A1",
+            valueInputOption="RAW",
+            body={"values": filas}
+        ).execute()
+    except Exception as e:
+        print("Error guardando renovaciones: " + str(e))
+
+
+def cargar_renovaciones():
+    try:
+        service = get_sheets_service()
+        result = service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID, range="Renovaciones!A:E"
+        ).execute()
+        filas = result.get("values", [])
+        cargadas = 0
+        for fila in filas[1:]:
+            if len(fila) >= 5:
+                renovaciones[fila[0]] = {
+                    "vencimiento": float(fila[1]),
+                    "tipo_cuenta": fila[2],
+                    "meses": fila[3],
+                    "notificado": fila[4] == "True"
+                }
+                cargadas += 1
+        print("Renovaciones cargadas: " + str(cargadas))
+    except Exception as e:
+        print("Error cargando renovaciones: " + str(e))
+
+
 def registrar_compra(phone, tipo_cuenta, meses):
     global _sheets_errores_consecutivos
     try:
@@ -115,6 +182,15 @@ def registrar_compra(phone, tipo_cuenta, meses):
             body={"values": valores}
         ).execute()
         _sheets_errores_consecutivos = 0
+        # Guardar fecha de vencimiento para el aviso de renovacion
+        dias = MESES_A_DIAS.get(meses, 30)
+        renovaciones[phone] = {
+            "vencimiento": time.time() + (dias * 86400),
+            "tipo_cuenta": tipo_cuenta,
+            "meses": meses,
+            "notificado": False
+        }
+        guardar_renovaciones()
     except Exception as e:
         _sheets_errores_consecutivos += 1
         print("Error Sheets: " + str(e))
@@ -542,6 +618,45 @@ def scheduler():
             )
             ultimo_resumen = hoy
 
+        # 5. Avisos de vencimiento de servicio (mismo día)
+        for phone_rv, datos_rv in list(renovaciones.items()):
+            if datos_rv.get("notificado"):
+                continue
+            if ahora >= datos_rv.get("vencimiento", 0):
+                tipo_rv = datos_rv.get("tipo_cuenta", "")
+                meses_rv = datos_rv.get("meses", "")
+                send_message(phone_rv,
+                    "Hola! 🎮 Hoy vence tu servicio de *Game Pass Ultimate* "
+                    "(" + tipo_rv + " - " + meses_rv + ").\n\n"
+                    "¿Deseas renovarlo?"
+                )
+                enviar_botones(phone_rv, "¿Quieres renovar tu Game Pass?", [
+                    {"id": "renovar_si", "titulo": "Sí, quiero renovar"},
+                    {"id": "renovar_no", "titulo": "No por ahora"}
+                ])
+                if phone_rv not in conversaciones:
+                    conversaciones[phone_rv] = {"ultima_interaccion": ahora}
+                conversaciones[phone_rv]["estado"] = "renovacion_pendiente"
+                conversaciones[phone_rv]["ultima_interaccion"] = ahora
+                renovaciones[phone_rv]["notificado"] = True
+                guardar_renovaciones()
+
+        # 6. Recordatorio único de pago de renovación (al cumplirse el tiempo que dijo el cliente)
+        for phone, datos in list(conversaciones.items()):
+            if datos.get("estado") != "renovacion_espera_pago":
+                continue
+            if datos.get("renovacion_recordatorio_enviado"):
+                continue
+            recordatorio_at = datos.get("renovacion_recordatorio_at", 0)
+            if recordatorio_at and ahora >= recordatorio_at:
+                meses_rv = renovaciones.get(phone, {}).get("meses", "")
+                send_message(phone,
+                    "⏰ Recordatorio Game Line Col\n\n"
+                    "Tu renovacion de Game Pass" + (" " + meses_rv if meses_rv else "") + " sigue pendiente de pago.\n\n"
+                    "Cuando hayas pagado envianos la foto del comprobante aqui 📸"
+                )
+                conversaciones[phone]["renovacion_recordatorio_enviado"] = True
+
         # 5. Guardar estados cada 5 minutos
         if (ahora - ultimo_guardado) >= 300:
             try:
@@ -587,6 +702,7 @@ conversaciones = {}
 asegurar_hoja("Estados")
 asegurar_hoja("Config")
 asegurar_hoja("Compras")
+asegurar_hoja("Renovaciones")
 
 def inicializar_compras():
     try:
@@ -607,6 +723,7 @@ def inicializar_compras():
 
 cargar_estados()
 cargar_config()
+cargar_renovaciones()
 inicializar_compras()
 threading.Thread(target=scheduler, daemon=True).start()
 
@@ -655,7 +772,12 @@ ESTADO_CLIENTE_MENSAJE = {
     "sop_jugando": "Diagnosticando problema de otro usuario jugando. Elige el tipo de cuenta.",
     "sop_jugando_p1": "Aplicando solucion para cuenta Principal. Prueba y cuentanos como te fue.",
     "sop_jugando_s1": "Aplicando solucion para cuenta Secundaria. Prueba y cuentanos como te fue.",
-    "soporte_asesor": "Tu caso fue escalado a un asesor, te contactara en breve 🙏"
+    "soporte_asesor": "Tu caso fue escalado a un asesor, te contactara en breve 🙏",
+    "renovacion_pendiente": "Te preguntamos si quieres renovar tu servicio. Usa los botones para responder.",
+    "renovacion_espera_admin": "Tu solicitud de renovacion fue enviada al asesor, en breve te respondemos 🙏",
+    "renovacion_espera_tiempo": "Dinos en cuanto tiempo puedes hacer el pago (ej: 30 minutos, 1 hora).",
+    "renovacion_espera_pago": "Estamos esperando tu comprobante de pago para la renovacion 📸",
+    "renovacion_comprobante_enviado": "Recibimos tu comprobante de renovacion, un asesor lo esta confirmando ⏳"
 }
 
 
@@ -814,20 +936,84 @@ def webhook():
             ultimos_4 = text_lower.replace("pagook", "").strip()
             cliente_encontrado = None
             for ph, datos in conversaciones.items():
-                if ph.endswith(ultimos_4) and datos.get("estado") in ("esperando_pago_final", "pago_final_enviado"):
+                if ph.endswith(ultimos_4) and datos.get("estado") in (
+                    "esperando_pago_final", "pago_final_enviado",
+                    "renovacion_espera_pago", "renovacion_comprobante_enviado"
+                ):
                     cliente_encontrado = ph
                     break
 
             if cliente_encontrado:
                 tipo_cuenta_c = conversaciones[cliente_encontrado].get("tipo_cuenta", "No especificado")
                 meses_c = conversaciones[cliente_encontrado].get("meses", "No especificado")
+                es_renovacion = conversaciones[cliente_encontrado].get("es_renovacion", False)
                 conversaciones[cliente_encontrado]["estado"] = "pago_confirmado"
                 send_message(cliente_encontrado, CIERRE)
                 send_message(ADMIN_PHONE, "✅ Pago confirmado, mensaje de cierre enviado al cliente +" + cliente_encontrado)
                 registrar_compra(cliente_encontrado, tipo_cuenta_c, meses_c)
                 registrar_evento_diario("cierres")
+                if es_renovacion:
+                    renovaciones[cliente_encontrado]["notificado"] = False  # reinicia ciclo
             else:
                 send_message(ADMIN_PHONE, "No encontre un cliente esperando confirmacion de pago con esos ultimos 4 digitos: " + ultimos_4)
+            return jsonify({"status": "ok"}), 200
+
+        if phone == ADMIN_PHONE and text_lower.startswith("misma"):
+            ultimos_4 = text_lower.replace("misma", "").strip()
+            cliente_encontrado = None
+            for ph, datos in conversaciones.items():
+                if ph.endswith(ultimos_4) and datos.get("estado") == "renovacion_espera_admin":
+                    cliente_encontrado = ph
+                    break
+            if cliente_encontrado:
+                meses_rv = renovaciones.get(cliente_encontrado, {}).get("meses", "1 mes")
+                monto_rv = PRECIOS_GAMEPASS.get(meses_rv)
+                link_rv, ref_rv = (None, None)
+                if monto_rv:
+                    link_rv, ref_rv = crear_link_pago(cliente_encontrado, "Renovacion Game Pass " + meses_rv, monto_rv)
+                if ref_rv:
+                    conversaciones[cliente_encontrado]["referencia_pago"] = ref_rv
+                    conversaciones[cliente_encontrado]["tipo_pago_pendiente"] = "renovacion"
+                send_message(cliente_encontrado,
+                    "Perfecto! Puedes renovar con las mismas opciones de pago 🎮\n\n" + mensaje_opciones_pago(link_rv)
+                )
+                send_message(cliente_encontrado,
+                    "¿En cuanto tiempo aproximado puedes hacer el pago?\n\n"
+                    "Ej: 30 minutos, 1 hora, 2 horas..."
+                )
+                conversaciones[cliente_encontrado]["estado"] = "renovacion_espera_tiempo"
+                conversaciones[cliente_encontrado]["es_renovacion"] = True
+                send_message(ADMIN_PHONE, "✅ Opciones de pago de renovacion enviadas al cliente +" + cliente_encontrado)
+            else:
+                send_message(ADMIN_PHONE, "No encontre un cliente esperando decision de renovacion con esos ultimos 4 digitos: " + ultimos_4)
+            return jsonify({"status": "ok"}), 200
+
+        if phone == ADMIN_PHONE and text_lower.startswith("cambia"):
+            ultimos_4 = text_lower.replace("cambia", "").strip()
+            cliente_encontrado = None
+            for ph, datos in conversaciones.items():
+                if ph.endswith(ultimos_4) and datos.get("estado") == "renovacion_espera_admin":
+                    cliente_encontrado = ph
+                    break
+            if cliente_encontrado:
+                send_message(cliente_encontrado,
+                    "Para renovar tu servicio vamos a cambiar la cuenta 🔄\n\n"
+                    "Por favor sigue estos pasos en tu consola:\n\n"
+                    "1️⃣ Ve a la configuracion de cuentas\n"
+                    "2️⃣ Busca la cuenta de Game Pass que tienes agregada\n"
+                    "3️⃣ *Elimina esa cuenta* completamente de la consola\n\n"
+                    "Cuando la hayas eliminado, genera el codigo para la nueva cuenta:"
+                )
+                send_message(cliente_encontrado, ACTIVACION)
+                conversaciones[cliente_encontrado]["estado"] = "activacion"
+                conversaciones[cliente_encontrado]["compro"] = False
+                conversaciones[cliente_encontrado]["codigo_pendiente"] = None
+                conversaciones[cliente_encontrado]["codigo_pendiente_at"] = None
+                conversaciones[cliente_encontrado]["codigo_recordatorio_enviado"] = False
+                conversaciones[cliente_encontrado]["es_renovacion"] = True
+                send_message(ADMIN_PHONE, "✅ Instrucciones de cambio de cuenta enviadas al cliente +" + cliente_encontrado + ". Espera nuevo codigo.")
+            else:
+                send_message(ADMIN_PHONE, "No encontre un cliente esperando decision de renovacion con esos ultimos 4 digitos: " + ultimos_4)
             return jsonify({"status": "ok"}), 200
 
         if phone == ADMIN_PHONE and text_lower == "pendientes":
@@ -904,7 +1090,7 @@ def webhook():
         tipo_cuenta = conversaciones[phone].get("tipo_cuenta", "No especificado")
 
         if msg_type == "image":
-            if estado in ("esperando_comprobante", "esperando_pago_final"):
+            if estado in ("esperando_comprobante", "esperando_pago_final", "renovacion_espera_pago"):
                 media_id = message["image"]["id"]
                 try:
                     media_bytes, mime_type = descargar_media(media_id)
@@ -917,6 +1103,10 @@ def webhook():
                     conversaciones[phone]["estado"] = "esperando_codigo_apartado"
                     send_message(phone, "Comprobante recibido! Un asesor confirmara tu reserva.\n\nCuando tengas tu consola disponible envianos el codigo de activacion aqui 🎮")
                     etiqueta = "COMPROBANTE DE PAGO (Reserva)"
+                elif estado == "renovacion_espera_pago":
+                    conversaciones[phone]["estado"] = "renovacion_comprobante_enviado"
+                    send_message(phone, "Comprobante recibido! Un asesor lo confirmara en breve. Gracias 🎮🙌")
+                    etiqueta = "COMPROBANTE RENOVACION"
                 else:
                     conversaciones[phone]["estado"] = "pago_final_enviado"
                     send_message(phone, "Comprobante recibido! Un asesor confirmara tu pago en breve. Gracias por tu compra 🎮🙌")
@@ -925,7 +1115,7 @@ def webhook():
                 reenviar_imagen(ADMIN_PHONE, media_id)
                 alerta = (etiqueta + " Game Line Col\nCliente: +" + phone + "\nMeses: " + meses +
                           "\nCuenta: " + tipo_cuenta + "\n\nLectura automatica:\n" + analisis +
-                          "\n\nConfirma el pago manualmente.")
+                          "\n\nResponde: pagook " + phone[-4:] + " para confirmar.")
                 send_message(ADMIN_PHONE, alerta)
             else:
                 send_message(phone, "Recibimos tu imagen, pero en este momento no la necesitamos. Si tienes alguna duda escribenos 😊")
@@ -965,6 +1155,51 @@ def webhook():
                 send_message(ADMIN_PHONE, alerta)
             else:
                 enviar_pregunta_consola(phone)
+            return jsonify({"status": "ok"}), 200
+
+        # ── RENOVACIÓN ───────────────────────────────────────────────────────
+        if estado == "renovacion_pendiente":
+            if text in ("renovar_si", "si", "sí", "yes", "quiero", "dale", "claro"):
+                tipo_rv = renovaciones.get(phone, {}).get("tipo_cuenta", "No especificado")
+                meses_rv = renovaciones.get(phone, {}).get("meses", "No especificado")
+                conversaciones[phone]["estado"] = "renovacion_espera_admin"
+                send_message(phone, "Perfecto! En un momento te confirmamos los detalles para tu renovacion 🎮")
+                send_message(ADMIN_PHONE,
+                    "🔄 RENOVACION Game Line Col\nCliente: +" + phone +
+                    "\nServicio actual: " + tipo_rv + " - " + meses_rv +
+                    "\n\nResponde:\n✅ misma " + phone[-4:] + " → Misma cuenta\n🔄 cambia " + phone[-4:] + " → Cambiar cuenta"
+                )
+            elif text in ("renovar_no", "no"):
+                conversaciones[phone]["estado"] = "menu"
+                send_message(phone, "Entendido! Si en algun momento quieres renovar, aqui estamos 🎮")
+            else:
+                enviar_botones(phone, "¿Quieres renovar tu Game Pass?", [
+                    {"id": "renovar_si", "titulo": "Sí, quiero renovar"},
+                    {"id": "renovar_no", "titulo": "No por ahora"}
+                ])
+            return jsonify({"status": "ok"}), 200
+
+        if estado == "renovacion_espera_admin":
+            send_message(phone, "Tu solicitud de renovacion ya fue enviada a nuestro asesor, en breve te respondemos 🙏")
+            return jsonify({"status": "ok"}), 200
+
+        if estado == "renovacion_espera_tiempo":
+            minutos = parsear_tiempo_minutos(text)
+            conversaciones[phone]["renovacion_recordatorio_at"] = time.time() + (minutos * 60)
+            conversaciones[phone]["renovacion_recordatorio_enviado"] = False
+            conversaciones[phone]["estado"] = "renovacion_espera_pago"
+            send_message(phone,
+                "Listo! Te enviare un recordatorio en " + str(minutos) + " minuto(s) ⏰\n\n"
+                "Cuando hayas pagado, envianos la foto del comprobante aqui 📸"
+            )
+            return jsonify({"status": "ok"}), 200
+
+        if estado == "renovacion_espera_pago":
+            send_message(phone, "Cuando hayas pagado, envianos la foto del comprobante aqui 📸")
+            return jsonify({"status": "ok"}), 200
+
+        if estado == "renovacion_comprobante_enviado":
+            send_message(phone, "Ya recibimos tu comprobante, un asesor lo esta confirmando ⏳")
             return jsonify({"status": "ok"}), 200
 
         if estado == "activacion" and es_codigo_consola(text):
