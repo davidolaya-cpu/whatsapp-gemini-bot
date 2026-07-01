@@ -31,6 +31,7 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 
 catalogo_media_id = None
 renovaciones = {}  # {phone: {vencimiento, tipo_cuenta, meses, notificado}}
+cuentas = []  # lista de dicts con el inventario de cuentas
 
 MESES_A_DIAS = {
     "1 mes": 30, "2 meses": 60, "3 meses": 90,
@@ -48,6 +49,103 @@ def parsear_tiempo_minutos(texto):
     if "media hora" in texto:
         return 30
     if "una hora" in texto:
+        return 60
+    return 30
+
+
+def cargar_cuentas():
+    global cuentas
+    try:
+        service = get_sheets_service()
+        result = service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID, range="Cuentas!A:F"
+        ).execute()
+        filas = result.get("values", [])
+        cuentas = []
+        for i, fila in enumerate(filas[1:], start=2):  # fila 1 es encabezado
+            while len(fila) < 6:
+                fila.append("")
+            cuentas.append({
+                "fila": i,
+                "email": fila[0],
+                "password": fila[1],
+                "principal_ocupado": fila[2].upper() == "SI",
+                "cliente_principal": fila[3],
+                "secundaria_ocupada": fila[4].upper() == "SI",
+                "cliente_secundaria": fila[5]
+            })
+        print("Cuentas cargadas: " + str(len(cuentas)))
+    except Exception as e:
+        print("Error cargando cuentas: " + str(e))
+
+
+def actualizar_fila_cuenta(fila_num, cuenta):
+    try:
+        service = get_sheets_service()
+        valores = [[
+            cuenta["email"],
+            cuenta["password"],
+            "SI" if cuenta["principal_ocupado"] else "NO",
+            cuenta["cliente_principal"],
+            "SI" if cuenta["secundaria_ocupada"] else "NO",
+            cuenta["cliente_secundaria"]
+        ]]
+        service.spreadsheets().values().update(
+            spreadsheetId=SHEET_ID,
+            range="Cuentas!A" + str(fila_num) + ":F" + str(fila_num),
+            valueInputOption="RAW",
+            body={"values": valores}
+        ).execute()
+    except Exception as e:
+        print("Error actualizando cuenta en Sheet: " + str(e))
+
+
+def asignar_cuenta(phone):
+    """Busca el primer cupo libre (Principal primero, luego Secundaria).
+    Retorna (email, password, tipo_cuenta) o None si no hay stock."""
+    for cuenta in cuentas:
+        if not cuenta["principal_ocupado"]:
+            cuenta["principal_ocupado"] = True
+            cuenta["cliente_principal"] = phone
+            actualizar_fila_cuenta(cuenta["fila"], cuenta)
+            verificar_stock_bajo()
+            return cuenta["email"], cuenta["password"], "Principal"
+    for cuenta in cuentas:
+        if not cuenta["secundaria_ocupada"]:
+            cuenta["secundaria_ocupada"] = True
+            cuenta["cliente_secundaria"] = phone
+            actualizar_fila_cuenta(cuenta["fila"], cuenta)
+            verificar_stock_bajo()
+            return cuenta["email"], cuenta["password"], "Secundaria"
+    return None
+
+
+def liberar_cuenta(phone):
+    """Libera todos los cupos asignados a un cliente (para renovación con cambio de cuenta)."""
+    for cuenta in cuentas:
+        cambio = False
+        if cuenta["cliente_principal"] == phone:
+            cuenta["principal_ocupado"] = False
+            cuenta["cliente_principal"] = ""
+            cambio = True
+        if cuenta["cliente_secundaria"] == phone:
+            cuenta["secundaria_ocupada"] = False
+            cuenta["cliente_secundaria"] = ""
+            cambio = True
+        if cambio:
+            actualizar_fila_cuenta(cuenta["fila"], cuenta)
+
+
+def verificar_stock_bajo():
+    """Avisa al admin si queda solo 1 cupo libre de cualquier tipo."""
+    libres_principal = sum(1 for c in cuentas if not c["principal_ocupado"])
+    libres_secundaria = sum(1 for c in cuentas if not c["secundaria_ocupada"])
+    if libres_principal == 1:
+        send_message(ADMIN_PHONE, "⚠️ Stock bajo: solo queda *1 cupo Principal* disponible. Considera agregar mas cuentas.")
+    if libres_secundaria == 1:
+        send_message(ADMIN_PHONE, "⚠️ Stock bajo: solo queda *1 cupo Secundaria* disponible. Considera agregar mas cuentas.")
+    if libres_principal == 0 and libres_secundaria == 0:
+        send_message(ADMIN_PHONE, "🚨 Sin stock: no hay cupos disponibles. Agrega cuentas urgente!")
         return 60
     return 30  # default
 
@@ -169,25 +267,25 @@ def cargar_renovaciones():
         print("Error cargando renovaciones: " + str(e))
 
 
-def registrar_compra(phone, tipo_cuenta, meses):
+def registrar_compra(phone, tipo_cuenta, meses, email_cuenta=""):
     global _sheets_errores_consecutivos
     try:
         service = get_sheets_service()
         fecha = datetime.now().strftime("%d/%m/%Y %H:%M")
-        valores = [["+" + phone, fecha, tipo_cuenta, meses]]
+        valores = [["+" + phone, fecha, tipo_cuenta, meses, email_cuenta]]
         service.spreadsheets().values().append(
             spreadsheetId=SHEET_ID,
-            range="Compras!A:D",
+            range="Compras!A:E",
             valueInputOption="RAW",
             body={"values": valores}
         ).execute()
         _sheets_errores_consecutivos = 0
-        # Guardar fecha de vencimiento para el aviso de renovacion
         dias = MESES_A_DIAS.get(meses, 30)
         renovaciones[phone] = {
             "vencimiento": time.time() + (dias * 86400),
             "tipo_cuenta": tipo_cuenta,
             "meses": meses,
+            "email_cuenta": email_cuenta,
             "notificado": False
         }
         guardar_renovaciones()
@@ -198,8 +296,7 @@ def registrar_compra(phone, tipo_cuenta, meses):
             try:
                 send_message(ADMIN_PHONE,
                     "⚠️ Alerta Game Line Col: el registro en Google Sheets ha fallado "
-                    "3 veces seguidas. Puede que el token o los permisos hayan vencido. "
-                    "Revisa las credenciales en Railway.")
+                    "3 veces seguidas. Revisa las credenciales en Railway.")
             except Exception:
                 pass
 
@@ -703,28 +800,38 @@ asegurar_hoja("Estados")
 asegurar_hoja("Config")
 asegurar_hoja("Compras")
 asegurar_hoja("Renovaciones")
+asegurar_hoja("Cuentas")
 
-def inicializar_compras():
+
+def inicializar_hojas():
     try:
         service = get_sheets_service()
-        result = service.spreadsheets().values().get(
-            spreadsheetId=SHEET_ID, range="Compras!A1:D1"
-        ).execute()
-        if not result.get("values"):
+        # Encabezados Compras
+        r = service.spreadsheets().values().get(spreadsheetId=SHEET_ID, range="Compras!A1:F1").execute()
+        if not r.get("values"):
             service.spreadsheets().values().update(
-                spreadsheetId=SHEET_ID,
-                range="Compras!A1",
+                spreadsheetId=SHEET_ID, range="Compras!A1",
                 valueInputOption="RAW",
-                body={"values": [["Teléfono", "Fecha de compra", "Tipo de cuenta", "Tiempo adquirido"]]}
+                body={"values": [["Teléfono", "Fecha de compra", "Tipo de cuenta", "Tiempo adquirido", "Email cuenta"]]}
             ).execute()
-            print("Encabezados de Compras creados")
+        # Encabezados Cuentas
+        r2 = service.spreadsheets().values().get(spreadsheetId=SHEET_ID, range="Cuentas!A1:F1").execute()
+        if not r2.get("values"):
+            service.spreadsheets().values().update(
+                spreadsheetId=SHEET_ID, range="Cuentas!A1",
+                valueInputOption="RAW",
+                body={"values": [["Email", "Contraseña", "Principal Ocupado", "Cliente Principal", "Secundaria Ocupada", "Cliente Secundaria"]]}
+            ).execute()
+        print("Hojas inicializadas")
     except Exception as e:
-        print("Error inicializando Compras: " + str(e))
+        print("Error inicializando hojas: " + str(e))
+
 
 cargar_estados()
 cargar_config()
 cargar_renovaciones()
-inicializar_compras()
+cargar_cuentas()
+inicializar_hojas()
 threading.Thread(target=scheduler, daemon=True).start()
 
 BIENVENIDA = "🎮 Bienvenido a Game Line Col! 🎮\n\nSomos tu tienda de confianza para juegos y suscripciones Xbox.\n\nEn que te podemos ayudar? 👇"
@@ -996,22 +1103,42 @@ def webhook():
                     cliente_encontrado = ph
                     break
             if cliente_encontrado:
-                send_message(cliente_encontrado,
-                    "Para renovar tu servicio vamos a cambiar la cuenta 🔄\n\n"
-                    "Por favor sigue estos pasos en tu consola:\n\n"
-                    "1️⃣ Ve a la configuracion de cuentas\n"
-                    "2️⃣ Busca la cuenta de Game Pass que tienes agregada\n"
-                    "3️⃣ *Elimina esa cuenta* completamente de la consola\n\n"
-                    "Cuando la hayas eliminado, genera el codigo para la nueva cuenta:"
-                )
-                send_message(cliente_encontrado, ACTIVACION)
-                conversaciones[cliente_encontrado]["estado"] = "activacion"
-                conversaciones[cliente_encontrado]["compro"] = False
-                conversaciones[cliente_encontrado]["codigo_pendiente"] = None
-                conversaciones[cliente_encontrado]["codigo_pendiente_at"] = None
-                conversaciones[cliente_encontrado]["codigo_recordatorio_enviado"] = False
+                meses_rv = renovaciones.get(cliente_encontrado, {}).get("meses", "1 mes")
+                liberar_cuenta(cliente_encontrado)
+                asignacion_rv = asignar_cuenta(cliente_encontrado)
+                if not asignacion_rv:
+                    send_message(ADMIN_PHONE, "❌ No hay cuentas disponibles para asignar al cliente +" + cliente_encontrado + ". Agrega stock primero.")
+                    return jsonify({"status": "ok"}), 200
+                email_rv, password_rv, tipo_rv = asignacion_rv
+                conversaciones[cliente_encontrado]["tipo_cuenta"] = tipo_rv
+                conversaciones[cliente_encontrado]["email_cuenta"] = email_rv
+                conversaciones[cliente_encontrado]["estado"] = "esperando_pago_final"
                 conversaciones[cliente_encontrado]["es_renovacion"] = True
-                send_message(ADMIN_PHONE, "✅ Instrucciones de cambio de cuenta enviadas al cliente +" + cliente_encontrado + ". Espera nuevo codigo.")
+                config_rv = CONFIG_PRINCIPAL if tipo_rv == "Principal" else CONFIG_SECUNDARIA
+                monto_rv = PRECIOS_GAMEPASS.get(meses_rv)
+                link_rv, ref_rv = (None, None)
+                if monto_rv:
+                    link_rv, ref_rv = crear_link_pago(cliente_encontrado, "Renovacion Game Pass " + tipo_rv + " - " + meses_rv, monto_rv)
+                if ref_rv:
+                    conversaciones[cliente_encontrado]["referencia_pago"] = ref_rv
+                    conversaciones[cliente_encontrado]["tipo_pago_pendiente"] = "renovacion"
+                send_message(cliente_encontrado,
+                    "Para tu renovacion vamos a asignarte una nueva cuenta 🔄\n\n"
+                    "Primero *elimina la cuenta anterior* de tu consola, luego agrega esta:\n\n"
+                    "📧 *Email:* " + email_rv + "\n"
+                    "🔒 *Contraseña:* " + password_rv
+                )
+                send_message(cliente_encontrado,
+                    "PASOS EN TU CONSOLA:\n\n"
+                    "1️⃣ Ve a *Agregar nueva cuenta*\n"
+                    "2️⃣ Ingresa el email y contraseña que te compartimos arriba\n"
+                    "3️⃣ Sigue la configuracion:\n\n" + config_rv
+                )
+                send_message(cliente_encontrado, "REALIZA EL PAGO:\n\n" + mensaje_opciones_pago(link_rv))
+                send_message(ADMIN_PHONE,
+                    "✅ Nueva cuenta asignada al cliente +" + cliente_encontrado +
+                    "\nEmail: " + email_rv + "\nTipo: " + tipo_rv
+                )
             else:
                 send_message(ADMIN_PHONE, "No encontre un cliente esperando decision de renovacion con esos ultimos 4 digitos: " + ultimos_4)
             return jsonify({"status": "ok"}), 200
@@ -1090,7 +1217,7 @@ def webhook():
         tipo_cuenta = conversaciones[phone].get("tipo_cuenta", "No especificado")
 
         if msg_type == "image":
-            if estado in ("esperando_comprobante", "esperando_pago_final", "renovacion_espera_pago"):
+            if estado in ("esperando_pago_final", "pago_final_enviado", "renovacion_espera_pago"):
                 media_id = message["image"]["id"]
                 try:
                     media_bytes, mime_type = descargar_media(media_id)
@@ -1099,22 +1226,19 @@ def webhook():
                     print("Error procesando imagen: " + str(e))
                     analisis = "No pude leer el comprobante automaticamente, revisa la imagen manualmente."
 
-                if estado == "esperando_comprobante":
-                    conversaciones[phone]["estado"] = "esperando_codigo_apartado"
-                    send_message(phone, "Comprobante recibido! Un asesor confirmara tu reserva.\n\nCuando tengas tu consola disponible envianos el codigo de activacion aqui 🎮")
-                    etiqueta = "COMPROBANTE DE PAGO (Reserva)"
-                elif estado == "renovacion_espera_pago":
+                if estado == "renovacion_espera_pago":
                     conversaciones[phone]["estado"] = "renovacion_comprobante_enviado"
                     send_message(phone, "Comprobante recibido! Un asesor lo confirmara en breve. Gracias 🎮🙌")
                     etiqueta = "COMPROBANTE RENOVACION"
                 else:
                     conversaciones[phone]["estado"] = "pago_final_enviado"
                     send_message(phone, "Comprobante recibido! Un asesor confirmara tu pago en breve. Gracias por tu compra 🎮🙌")
-                    etiqueta = "COMPROBANTE DE PAGO (Activacion final)"
+                    etiqueta = "COMPROBANTE DE PAGO"
 
                 reenviar_imagen(ADMIN_PHONE, media_id)
-                alerta = (etiqueta + " Game Line Col\nCliente: +" + phone + "\nMeses: " + meses +
-                          "\nCuenta: " + tipo_cuenta + "\n\nLectura automatica:\n" + analisis +
+                alerta = (etiqueta + " Game Line Col\nCliente: +" + phone +
+                          "\nPlan: " + meses + " - " + tipo_cuenta +
+                          "\n\nLectura automatica:\n" + analisis +
                           "\n\nResponde: pagook " + phone[-4:] + " para confirmar.")
                 send_message(ADMIN_PHONE, alerta)
             else:
@@ -1125,36 +1249,89 @@ def webhook():
             m = extraer_meses(text)
             if m:
                 conversaciones[phone]["meses"] = m
-                conversaciones[phone]["estado"] = "preguntar_consola"
-                send_message(phone, "Seleccionaste " + m + ". 🎮")
-                enviar_pregunta_consola(phone)
+                conversaciones[phone]["estado"] = "confirmacion_compra"
+                enviar_botones(phone,
+                    "Vas a contratar *Game Pass Ultimate - " + m + "*\n\n"
+                    "📅 Duracion: " + m + "\n"
+                    "💰 Precio: $" + str(PRECIOS_GAMEPASS.get(m, "")) + "\n\n"
+                    "¿Confirmas tu compra?",
+                    [
+                        {"id": "confirmar_compra", "titulo": "✅ Sí, confirmo"},
+                        {"id": "cancelar_compra", "titulo": "❌ Cancelar"}
+                    ]
+                )
             else:
                 send_message(phone, "No entendi cual plan elegiste 🙏")
                 enviar_pregunta_meses(phone)
             return jsonify({"status": "ok"}), 200
 
-        if estado == "preguntar_consola":
-            meses = conversaciones[phone].get("meses", "No especificado")
-            if "1" in text or "si" in text_lower or "tengo" in text_lower:
-                conversaciones[phone]["estado"] = "activacion"
-                send_message(phone, ACTIVACION)
-                alerta = "NUEVO CLIENTE Game Line Col\nCliente: +" + phone + "\nMeses: " + meses + "\nEspera codigo de activacion!"
-                send_message(ADMIN_PHONE, alerta)
-            elif "2" in text or "no" in text_lower or "apartar" in text_lower:
-                conversaciones[phone]["estado"] = "esperando_comprobante"
-                monto_r = PRECIOS_GAMEPASS.get(meses)
-                link_r, referencia_r = (None, None)
-                if monto_r:
-                    link_r, referencia_r = crear_link_pago(phone, "Reserva Game Pass " + tipo_cuenta + " - " + meses, monto_r)
-                if referencia_r:
-                    conversaciones[phone]["referencia_pago"] = referencia_r
-                    conversaciones[phone]["tipo_pago_pendiente"] = "reserva"
-                mensaje_apartar = "Sin problema! Aparta tu servicio pagando ahora.\n\n" + mensaje_opciones_pago(link_r) + "\n\nCuando tengas tu consola lista te indicamos como activarlo 🎮"
-                send_message(phone, mensaje_apartar)
-                alerta = "CLIENTE QUIERE APARTAR Game Line Col\nCliente: +" + phone + "\nMeses: " + meses + "\nCuenta: " + tipo_cuenta + "\nEspera comprobante!"
-                send_message(ADMIN_PHONE, alerta)
+        if estado == "confirmacion_compra":
+            if text in ("confirmar_compra", "si", "sí", "yes", "confirmo", "dale"):
+                meses = conversaciones[phone].get("meses", "1 mes")
+                asignacion = asignar_cuenta(phone)
+                if not asignacion:
+                    send_message(phone,
+                        "Lo sentimos, en este momento no tenemos disponibilidad 😔\n\n"
+                        "Un asesor te contactara pronto para buscar una solucion."
+                    )
+                    send_message(ADMIN_PHONE,
+                        "🚨 Sin stock - Game Line Col\nCliente +" + phone +
+                        " quiso contratar " + meses + " pero no hay cuentas disponibles."
+                    )
+                    conversaciones[phone]["estado"] = "menu"
+                    return jsonify({"status": "ok"}), 200
+
+                email_asig, password_asig, tipo_asig = asignacion
+                conversaciones[phone]["tipo_cuenta"] = tipo_asig
+                conversaciones[phone]["email_cuenta"] = email_asig
+                conversaciones[phone]["estado"] = "esperando_pago_final"
+
+                config_asig = CONFIG_PRINCIPAL if tipo_asig == "Principal" else CONFIG_SECUNDARIA
+
+                monto_asig = PRECIOS_GAMEPASS.get(meses)
+                link_asig, ref_asig = (None, None)
+                if monto_asig:
+                    link_asig, ref_asig = crear_link_pago(phone, "Game Pass Ultimate " + tipo_asig + " - " + meses, monto_asig)
+                if ref_asig:
+                    conversaciones[phone]["referencia_pago"] = ref_asig
+                    conversaciones[phone]["tipo_pago_pendiente"] = "final"
+
+                send_message(phone,
+                    "✅ Tu cuenta de Game Pass Ultimate ha sido asignada! 🎮\n\n"
+                    "📅 Plan: " + meses + " - Cuenta " + tipo_asig + "\n\n"
+                    "📧 *Email:* " + email_asig + "\n"
+                    "🔒 *Contraseña:* " + password_asig
+                )
+                send_message(phone,
+                    "PASO 1 - AGREGAR LA CUENTA EN TU CONSOLA:\n\n"
+                    "1️⃣ Ve a *Agregar nueva cuenta*\n"
+                    "2️⃣ Ingresa el *email y contraseña* que te compartimos arriba\n"
+                    "3️⃣ Sigue la configuracion a continuacion 👇"
+                )
+                send_message(phone, "CONFIGURACION DE TU CUENTA:\n\n" + config_asig)
+                send_message(phone,
+                    "PASO 2 - REALIZA EL PAGO:\n\n" + mensaje_opciones_pago(link_asig)
+                )
+
+                send_message(ADMIN_PHONE,
+                    "🎮 NUEVA ASIGNACION Game Line Col\n"
+                    "Cliente: +" + phone + "\nPlan: " + meses + " - Cuenta " + tipo_asig +
+                    "\n\n📧 Email: " + email_asig +
+                    "\n🔒 Contraseña: " + password_asig +
+                    "\n\nVerifica que esta cuenta ya este canjeada (con Game Pass activo) antes de que el cliente la use."
+                )
+
+            elif text in ("cancelar_compra", "no", "cancelar"):
+                conversaciones[phone]["estado"] = "menu"
+                send_message(phone, "Entendido! Si cambias de opinion escribe *hola* cuando quieras 😊")
             else:
-                enviar_pregunta_consola(phone)
+                enviar_botones(phone,
+                    "¿Confirmas tu compra de Game Pass Ultimate - " + conversaciones[phone].get("meses", "") + "?",
+                    [
+                        {"id": "confirmar_compra", "titulo": "✅ Sí, confirmo"},
+                        {"id": "cancelar_compra", "titulo": "❌ Cancelar"}
+                    ]
+                )
             return jsonify({"status": "ok"}), 200
 
         # ── RENOVACIÓN ───────────────────────────────────────────────────────
@@ -1202,42 +1379,8 @@ def webhook():
             send_message(phone, "Ya recibimos tu comprobante, un asesor lo esta confirmando ⏳")
             return jsonify({"status": "ok"}), 200
 
-        if estado == "activacion" and es_codigo_consola(text):
-            meses = conversaciones[phone].get("meses", "No especificado")
-            conversaciones[phone]["compro"] = True
-            conversaciones[phone]["codigo_pendiente"] = text
-            conversaciones[phone]["codigo_pendiente_at"] = time.time()
-            conversaciones[phone]["codigo_recordatorio_enviado"] = False
-            send_message(phone, "Codigo recibido! Nuestro asesor lo activara en breve. 🎮\n\nTe avisaremos cuando este lista la activacion.")
-            alerta = ("CODIGO DE ACTIVACION Game Line Col\n"
-                      "Cliente: +" + phone + "\nMeses: " + meses + "\nCodigo: " + text + "\n\n"
-                      "Para confirmar responde:\n"
-                      "✅ activo " + phone[-4:] + " p → Cuenta Principal\n"
-                      "✅ activo " + phone[-4:] + " s → Cuenta Secundaria")
-            send_message(ADMIN_PHONE, alerta)
-            return jsonify({"status": "ok"}), 200
-
-        if estado == "esperando_comprobante":
-            send_message(phone, "Para confirmar tu reserva necesitamos la foto de tu comprobante de pago 📸")
-            return jsonify({"status": "ok"}), 200
-
         if estado == "esperando_pago_final":
-            send_message(phone, "Para confirmar tu activacion necesitamos la foto de tu comprobante de pago 📸")
-            return jsonify({"status": "ok"}), 200
-
-        if estado == "esperando_codigo_apartado" and es_codigo_consola(text):
-            meses = conversaciones[phone].get("meses", "No especificado")
-            conversaciones[phone]["compro"] = True
-            conversaciones[phone]["codigo_pendiente"] = text
-            conversaciones[phone]["codigo_pendiente_at"] = time.time()
-            conversaciones[phone]["codigo_recordatorio_enviado"] = False
-            send_message(phone, "Codigo recibido! Nuestro asesor lo activara en breve. 🎮\n\nTe avisaremos cuando este lista la activacion.")
-            alerta = ("CODIGO ACTIVACION APARTADO Game Line Col\n"
-                      "Cliente: +" + phone + "\nMeses: " + meses + "\nCodigo: " + text + "\n\n"
-                      "Para confirmar responde:\n"
-                      "✅ activo " + phone[-4:] + " p → Cuenta Principal\n"
-                      "✅ activo " + phone[-4:] + " s → Cuenta Secundaria")
-            send_message(ADMIN_PHONE, alerta)
+            send_message(phone, "Cuando hayas pagado, envianos la foto del comprobante aqui 📸")
             return jsonify({"status": "ok"}), 200
 
         if text == "1" or ("game pass" in text_lower and estado == "menu"):
