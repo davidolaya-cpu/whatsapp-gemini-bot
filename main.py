@@ -1053,14 +1053,15 @@ def webhook():
             if cliente_encontrado:
                 tipo_cuenta_c = conversaciones[cliente_encontrado].get("tipo_cuenta", "No especificado")
                 meses_c = conversaciones[cliente_encontrado].get("meses", "No especificado")
+                email_c = conversaciones[cliente_encontrado].get("email_cuenta", "")
                 es_renovacion = conversaciones[cliente_encontrado].get("es_renovacion", False)
                 conversaciones[cliente_encontrado]["estado"] = "pago_confirmado"
                 send_message(cliente_encontrado, CIERRE)
-                send_message(ADMIN_PHONE, "✅ Pago confirmado, mensaje de cierre enviado al cliente +" + cliente_encontrado)
-                registrar_compra(cliente_encontrado, tipo_cuenta_c, meses_c)
+                send_message(ADMIN_PHONE, "✅ Pago confirmado, cierre enviado al cliente +" + cliente_encontrado)
+                registrar_compra(cliente_encontrado, tipo_cuenta_c, meses_c, email_c)
                 registrar_evento_diario("cierres")
                 if es_renovacion:
-                    renovaciones[cliente_encontrado]["notificado"] = False  # reinicia ciclo
+                    renovaciones[cliente_encontrado]["notificado"] = False
             else:
                 send_message(ADMIN_PHONE, "No encontre un cliente esperando confirmacion de pago con esos ultimos 4 digitos: " + ultimos_4)
             return jsonify({"status": "ok"}), 200
@@ -1288,13 +1289,17 @@ def webhook():
 
                 config_asig = CONFIG_PRINCIPAL if tipo_asig == "Principal" else CONFIG_SECUNDARIA
 
-                monto_asig = PRECIOS_GAMEPASS.get(meses)
-                link_asig, ref_asig = (None, None)
-                if monto_asig:
-                    link_asig, ref_asig = crear_link_pago(phone, "Game Pass Ultimate " + tipo_asig + " - " + meses, monto_asig)
-                if ref_asig:
-                    conversaciones[phone]["referencia_pago"] = ref_asig
-                    conversaciones[phone]["tipo_pago_pendiente"] = "final"
+                try:
+                    monto_asig = PRECIOS_GAMEPASS.get(meses)
+                    link_asig, ref_asig = (None, None)
+                    if monto_asig:
+                        link_asig, ref_asig = crear_link_pago(phone, "Game Pass Ultimate " + tipo_asig + " - " + meses, monto_asig)
+                    if ref_asig:
+                        conversaciones[phone]["referencia_pago"] = ref_asig
+                        conversaciones[phone]["tipo_pago_pendiente"] = "final"
+                except Exception as e:
+                    print("Error creando link de pago: " + str(e))
+                    link_asig = None
 
                 send_message(phone,
                     "✅ Tu cuenta de Game Pass Ultimate ha sido asignada! 🎮\n\n"
@@ -1320,6 +1325,19 @@ def webhook():
                     "\n🔒 Contraseña: " + password_asig +
                     "\n\nVerifica que esta cuenta ya este canjeada (con Game Pass activo) antes de que el cliente la use."
                 )
+
+                # Registrar la asignacion en Sheets de inmediato (el pago se confirmara despues)
+                try:
+                    service = get_sheets_service()
+                    fecha = datetime.now().strftime("%d/%m/%Y %H:%M")
+                    service.spreadsheets().values().append(
+                        spreadsheetId=SHEET_ID,
+                        range="Compras!A:E",
+                        valueInputOption="RAW",
+                        body={"values": [["+" + phone, fecha, tipo_asig, meses, email_asig + " (pendiente pago)"]]}
+                    ).execute()
+                except Exception as e:
+                    print("Error registrando asignacion: " + str(e))
 
             elif text in ("cancelar_compra", "no", "cancelar"):
                 conversaciones[phone]["estado"] = "menu"
