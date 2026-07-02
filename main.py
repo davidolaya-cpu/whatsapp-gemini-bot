@@ -101,23 +101,64 @@ def actualizar_fila_cuenta(fila_num, cuenta):
 
 
 def asignar_cuenta(phone):
-    """Busca el primer cupo libre (Principal primero, luego Secundaria).
-    Retorna (email, password, tipo_cuenta) o None si no hay stock."""
-    for cuenta in cuentas:
-        if not cuenta["principal_ocupado"]:
-            cuenta["principal_ocupado"] = True
-            cuenta["cliente_principal"] = phone
-            actualizar_fila_cuenta(cuenta["fila"], cuenta)
-            verificar_stock_bajo()
-            return cuenta["email"], cuenta["password"], "Principal"
-    for cuenta in cuentas:
-        if not cuenta["secundaria_ocupada"]:
-            cuenta["secundaria_ocupada"] = True
-            cuenta["cliente_secundaria"] = phone
-            actualizar_fila_cuenta(cuenta["fila"], cuenta)
-            verificar_stock_bajo()
-            return cuenta["email"], cuenta["password"], "Secundaria"
-    return None
+    """Lee el Sheet en tiempo real y asigna el primer cupo libre de arriba hacia abajo.
+    Orden por cuenta: Principal → Secundaria, luego siguiente cuenta."""
+    try:
+        service = get_sheets_service()
+        result = service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID, range="Cuentas!A:F"
+        ).execute()
+        filas = result.get("values", [])
+        if not filas or len(filas) < 2:
+            print("Sheet Cuentas vacio o sin datos")
+            return None
+
+        for i, fila in enumerate(filas[1:], start=2):  # fila 1 es encabezado
+            while len(fila) < 6:
+                fila.append("")
+            email = fila[0].strip()
+            password = fila[1].strip()
+            if not email or not password:
+                continue
+            principal_ocupado = fila[2].strip().upper() == "SI"
+            secundaria_ocupada = fila[4].strip().upper() == "SI"
+
+            if not principal_ocupado:
+                # Actualizar en Sheet
+                service.spreadsheets().values().update(
+                    spreadsheetId=SHEET_ID,
+                    range="Cuentas!C" + str(i) + ":D" + str(i),
+                    valueInputOption="RAW",
+                    body={"values": [["SI", phone]]}
+                ).execute()
+                # Actualizar en memoria
+                for c in cuentas:
+                    if c["fila"] == i:
+                        c["principal_ocupado"] = True
+                        c["cliente_principal"] = phone
+                verificar_stock_bajo()
+                return email, password, "Principal"
+
+            if not secundaria_ocupada:
+                # Actualizar en Sheet
+                service.spreadsheets().values().update(
+                    spreadsheetId=SHEET_ID,
+                    range="Cuentas!E" + str(i) + ":F" + str(i),
+                    valueInputOption="RAW",
+                    body={"values": [["SI", phone]]}
+                ).execute()
+                # Actualizar en memoria
+                for c in cuentas:
+                    if c["fila"] == i:
+                        c["secundaria_ocupada"] = True
+                        c["cliente_secundaria"] = phone
+                verificar_stock_bajo()
+                return email, password, "Secundaria"
+
+        return None  # No hay cupos disponibles
+    except Exception as e:
+        print("Error asignando cuenta: " + str(e))
+        return None
 
 
 def liberar_cuenta(phone):
@@ -138,14 +179,30 @@ def liberar_cuenta(phone):
 
 def verificar_stock_bajo():
     """Avisa al admin si queda solo 1 cupo libre de cualquier tipo."""
-    libres_principal = sum(1 for c in cuentas if not c["principal_ocupado"])
-    libres_secundaria = sum(1 for c in cuentas if not c["secundaria_ocupada"])
-    if libres_principal == 1:
-        send_message(ADMIN_PHONE, "⚠️ Stock bajo: solo queda *1 cupo Principal* disponible. Considera agregar mas cuentas.")
-    if libres_secundaria == 1:
-        send_message(ADMIN_PHONE, "⚠️ Stock bajo: solo queda *1 cupo Secundaria* disponible. Considera agregar mas cuentas.")
-    if libres_principal == 0 and libres_secundaria == 0:
-        send_message(ADMIN_PHONE, "🚨 Sin stock: no hay cupos disponibles. Agrega cuentas urgente!")
+    try:
+        service = get_sheets_service()
+        result = service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID, range="Cuentas!A:F"
+        ).execute()
+        filas = result.get("values", [])
+        libres_principal = 0
+        libres_secundaria = 0
+        for fila in filas[1:]:
+            while len(fila) < 6:
+                fila.append("")
+            if fila[0].strip():
+                if fila[2].strip().upper() != "SI":
+                    libres_principal += 1
+                if fila[4].strip().upper() != "SI":
+                    libres_secundaria += 1
+        if libres_principal == 1:
+            send_message(ADMIN_PHONE, "⚠️ Stock bajo: solo queda *1 cupo Principal* disponible. Considera agregar mas cuentas.")
+        if libres_secundaria == 1:
+            send_message(ADMIN_PHONE, "⚠️ Stock bajo: solo queda *1 cupo Secundaria* disponible. Considera agregar mas cuentas.")
+        if libres_principal == 0 and libres_secundaria == 0:
+            send_message(ADMIN_PHONE, "🚨 Sin stock: no hay cupos disponibles. Agrega cuentas urgente!")
+    except Exception as e:
+        print("Error verificando stock: " + str(e))
         return 60
     return 30  # default
 
