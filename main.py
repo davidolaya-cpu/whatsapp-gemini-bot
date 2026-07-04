@@ -23,6 +23,7 @@ MP_NOTIFICATION_URL = os.environ.get("MP_NOTIFICATION_URL")
 SHEET_ID = "1lvIlK1LYbT68HsuDTbMRzWSYh_RGUPHAZeV31_sAmdU"
 ADMIN_PHONE = "573229082927"
 HORA_SEGUIMIENTO = 3600
+HORA_RECORDATORIO_CONSOLA = 86400  # 24h para recordarle al cliente que avise cuando tenga consola
 
 _flood_control = {}  # {phone: ultimo_timestamp_procesado}
 _sheets_errores_consecutivos = 0
@@ -688,8 +689,12 @@ def cargar_estados():
         print("Error cargando estados: " + str(e))
 
 
-ESTADOS_PENDIENTES = ["activacion", "esperando_comprobante", "esperando_codigo_apartado",
-                      "esperando_pago_final", "pago_final_enviado"]
+ESTADOS_PENDIENTES = ["activacion", "esperando_comprobante", "comprobante_reserva_enviado",
+                      "esperando_consola", "esperando_pago_final", "pago_final_enviado"]
+
+# Estados en los que el cliente NO tiene ningun proceso de compra activo.
+# Solo en estos casos un saludo puede reiniciar la conversacion al menu principal.
+ESTADOS_SIN_PROCESO_ACTIVO = ["menu", "pago_confirmado"]
 
 estadisticas_diarias = {"fecha": None, "nuevos": 0, "cierres": 0}
 
@@ -794,6 +799,18 @@ def scheduler():
                 conversaciones[phone_rv]["ultima_interaccion"] = ahora
                 renovaciones[phone_rv]["notificado"] = True
                 guardar_renovaciones()
+
+        # 5b. Recordatorio a clientes con reserva pagada que aun no avisan que tienen consola
+        for phone, datos in list(conversaciones.items()):
+            if datos.get("estado") != "esperando_consola":
+                continue
+            recordatorio_consola_at = datos.get("recordatorio_consola_at", 0)
+            if recordatorio_consola_at and ahora >= recordatorio_consola_at:
+                enviar_boton_consola_lista(phone,
+                    "Hola! 🎮 Solo para recordarte que tu reserva de Game Pass Ultimate ya esta pagada.\n\n"
+                    "Avisanos aqui cuando tengas tu consola o PC disponible y te entregamos tu cuenta al instante."
+                )
+                conversaciones[phone]["recordatorio_consola_at"] = ahora + HORA_RECORDATORIO_CONSOLA
 
         # 6. Recordatorio único de pago de renovación (al cumplirse el tiempo que dijo el cliente)
         for phone, datos in list(conversaciones.items()):
@@ -918,10 +935,11 @@ ESTADO_CLIENTE_MENSAJE = {
     "gamepass": "Estas viendo la info de Game Pass Ultimate. Responde si quieres contratar 😊",
     "seleccion_meses": "Estamos esperando que elijas el plan de meses.",
     "seleccion_cuenta": "Estamos esperando que elijas el tipo de cuenta (Principal o Secundaria).",
-    "preguntar_consola": "Estamos esperando que nos digas si tienes tu consola disponible.",
+    "preguntar_consola": "Estamos esperando que nos digas si tienes tu consola o PC disponible ahora.",
     "activacion": "Estamos esperando el codigo de activacion de tu consola. Envialo aqui cuando lo tengas 🎮",
     "esperando_comprobante": "Estamos esperando el comprobante de pago de tu reserva 📸",
-    "esperando_codigo_apartado": "Tu reserva esta pagada ✅. Estamos esperando que nos envies el codigo de activacion cuando tengas tu consola disponible.",
+    "comprobante_reserva_enviado": "Recibimos el comprobante de tu reserva, un asesor lo esta confirmando ⏳",
+    "esperando_consola": "Tu reserva esta confirmada ✅. Avisanos aqui cuando tengas tu consola o PC disponible para entregarte tu cuenta 🎮",
     "esperando_pago_final": "Tu cuenta ya esta activada 🎮. Estamos esperando el comprobante del pago final 📸",
     "pago_final_enviado": "Recibimos tu comprobante de pago final, un asesor lo esta confirmando ⏳",
     "pago_confirmado": "Tu pedido esta cerrado y confirmado. Gracias por tu compra! 🎮🙌",
@@ -978,8 +996,14 @@ def enviar_pregunta_cuenta(phone, prefijo=""):
 
 def enviar_pregunta_consola(phone, prefijo=""):
     enviar_botones(phone, prefijo + PREGUNTAR_CONSOLA, [
-        {"id": "1", "titulo": "Sí, tengo consola"},
-        {"id": "2", "titulo": "Quiero apartar"}
+        {"id": "consola_si", "titulo": "Sí, la tengo"},
+        {"id": "consola_no", "titulo": "No la tengo ahora"}
+    ])
+
+
+def enviar_boton_consola_lista(phone, mensaje):
+    enviar_botones(phone, mensaje, [
+        {"id": "consola_lista", "titulo": "🎮 Ya tengo mi consola"}
     ])
 
 
@@ -1123,6 +1147,28 @@ def webhook():
                 send_message(ADMIN_PHONE, "No encontre un cliente esperando confirmacion de pago con esos ultimos 4 digitos: " + ultimos_4)
             return jsonify({"status": "ok"}), 200
 
+        if phone == ADMIN_PHONE and text_lower.startswith("reservaok"):
+            ultimos_4 = text_lower.replace("reservaok", "").strip()
+            cliente_encontrado = None
+            for ph, datos in conversaciones.items():
+                if ph.endswith(ultimos_4) and datos.get("estado") in ("esperando_comprobante", "comprobante_reserva_enviado"):
+                    cliente_encontrado = ph
+                    break
+
+            if cliente_encontrado:
+                conversaciones[cliente_encontrado]["estado"] = "esperando_consola"
+                conversaciones[cliente_encontrado]["reserva_pagada"] = True
+                conversaciones[cliente_encontrado]["recordatorio_consola_at"] = time.time() + HORA_RECORDATORIO_CONSOLA
+                registrar_evento_diario("reservas")
+                enviar_boton_consola_lista(cliente_encontrado,
+                    "✅ Tu reserva quedo confirmada!\n\n"
+                    "Cuando tengas tu consola o PC disponible, avisanos aqui para entregarte tu cuenta al instante 🎮"
+                )
+                send_message(ADMIN_PHONE, "✅ Reserva confirmada para +" + cliente_encontrado + ". Quedara esperando a que avise cuando tenga consola.")
+            else:
+                send_message(ADMIN_PHONE, "No encontre un cliente con reserva pendiente con esos ultimos 4 digitos: " + ultimos_4)
+            return jsonify({"status": "ok"}), 200
+
         if phone == ADMIN_PHONE and text_lower.startswith("misma"):
             ultimos_4 = text_lower.replace("misma", "").strip()
             cliente_encontrado = None
@@ -1237,12 +1283,41 @@ def webhook():
             return jsonify({"status": "ok"}), 200
         conversaciones[phone]["ultimo_msg_id"] = msg_id
 
-        if not conversaciones[phone].get("bienvenida_enviada") or es_saludo:
+        # Cliente totalmente nuevo: siempre se le da la bienvenida completa.
+        if not conversaciones[phone].get("bienvenida_enviada"):
             conversaciones[phone]["bienvenida_enviada"] = True
             conversaciones[phone]["estado"] = "menu"
             conversaciones[phone]["ultima_interaccion"] = time.time()
             send_message(phone, BIENVENIDA)
             enviar_menu_principal(phone)
+            return jsonify({"status": "ok"}), 200
+
+        # Comando explicito para reiniciar al menu principal a proposito.
+        if text_lower == "menu":
+            conversaciones[phone]["estado"] = "menu"
+            conversaciones[phone]["ultima_interaccion"] = time.time()
+            send_message(phone, "Volviendo al menu principal 🎮")
+            enviar_menu_principal(phone)
+            return jsonify({"status": "ok"}), 200
+
+        # Un saludo NO debe borrar un proceso de compra en curso (esto causaba
+        # que el bot "olvidara" a clientes que escribian horas despues).
+        # Solo reiniciamos al menu si el cliente no tiene nada pendiente.
+        if es_saludo:
+            estado_saludo = conversaciones[phone].get("estado", "menu")
+            conversaciones[phone]["ultima_interaccion"] = time.time()
+            if estado_saludo in ESTADOS_SIN_PROCESO_ACTIVO:
+                conversaciones[phone]["estado"] = "menu"
+                send_message(phone, BIENVENIDA)
+                enviar_menu_principal(phone)
+            else:
+                descripcion_saludo = ESTADO_CLIENTE_MENSAJE.get(
+                    estado_saludo, "Tienes un proceso en curso con nosotros."
+                )
+                send_message(phone,
+                    "Hola de nuevo! 👋\n\n" + descripcion_saludo +
+                    "\n\nSi quieres iniciar algo nuevo, escribe *menu*."
+                )
             return jsonify({"status": "ok"}), 200
 
         if es_agradecimiento(text) and conversaciones[phone].get("compro"):
@@ -1275,7 +1350,7 @@ def webhook():
         tipo_cuenta = conversaciones[phone].get("tipo_cuenta", "No especificado")
 
         if msg_type == "image":
-            if estado in ("esperando_pago_final", "pago_final_enviado", "renovacion_espera_pago"):
+            if estado in ("esperando_pago_final", "pago_final_enviado", "renovacion_espera_pago", "esperando_comprobante"):
                 media_id = message["image"]["id"]
                 try:
                     media_bytes, mime_type = descargar_media(media_id)
@@ -1288,16 +1363,23 @@ def webhook():
                     conversaciones[phone]["estado"] = "renovacion_comprobante_enviado"
                     send_message(phone, "Comprobante recibido! Un asesor lo confirmara en breve. Gracias 🎮🙌")
                     etiqueta = "COMPROBANTE RENOVACION"
+                    comando_confirmacion = "pagook " + phone[-4:]
+                elif estado == "esperando_comprobante":
+                    conversaciones[phone]["estado"] = "comprobante_reserva_enviado"
+                    send_message(phone, "Comprobante recibido! Un asesor confirmara tu reserva en breve. Gracias 🎮🙌")
+                    etiqueta = "COMPROBANTE DE RESERVA"
+                    comando_confirmacion = "reservaok " + phone[-4:]
                 else:
                     conversaciones[phone]["estado"] = "pago_final_enviado"
                     send_message(phone, "Comprobante recibido! Un asesor confirmara tu pago en breve. Gracias por tu compra 🎮🙌")
                     etiqueta = "COMPROBANTE DE PAGO"
+                    comando_confirmacion = "pagook " + phone[-4:]
 
                 reenviar_imagen(ADMIN_PHONE, media_id)
                 alerta = (etiqueta + " Game Line Col\nCliente: +" + phone +
                           "\nPlan: " + meses + " - " + tipo_cuenta +
                           "\n\nLectura automatica:\n" + analisis +
-                          "\n\nResponde: pagook " + phone[-4:] + " para confirmar.")
+                          "\n\nResponde: " + comando_confirmacion + " para confirmar.")
                 send_message(ADMIN_PHONE, alerta)
             else:
                 send_message(phone, "Recibimos tu imagen, pero en este momento no la necesitamos. Si tienes alguna duda escribenos 😊")
@@ -1325,7 +1407,26 @@ def webhook():
 
         if estado == "confirmacion_compra":
             if text in ("confirmar_compra", "si", "sí", "yes", "confirmo", "dale"):
-                meses = conversaciones[phone].get("meses", "1 mes")
+                conversaciones[phone]["estado"] = "preguntar_consola"
+                enviar_pregunta_consola(phone)
+            elif text in ("cancelar_compra", "no", "cancelar"):
+                conversaciones[phone]["estado"] = "menu"
+                send_message(phone, "Entendido! Si cambias de opinion escribe *hola* cuando quieras 😊")
+            else:
+                enviar_botones(phone,
+                    "¿Confirmas tu compra de Game Pass Ultimate - " + conversaciones[phone].get("meses", "") + "?",
+                    [
+                        {"id": "confirmar_compra", "titulo": "✅ Sí, confirmo"},
+                        {"id": "cancelar_compra", "titulo": "❌ Cancelar"}
+                    ]
+                )
+            return jsonify({"status": "ok"}), 200
+
+        # ── ¿TIENE CONSOLA/PC DISPONIBLE? ───────────────────────────────────
+        if estado == "preguntar_consola":
+            meses = conversaciones[phone].get("meses", "1 mes")
+
+            if text == "consola_si":
                 asignacion = asignar_cuenta(phone)
                 if not asignacion:
                     send_message(phone,
@@ -1396,17 +1497,30 @@ def webhook():
                 except Exception as e:
                     print("Error registrando asignacion: " + str(e))
 
-            elif text in ("cancelar_compra", "no", "cancelar"):
-                conversaciones[phone]["estado"] = "menu"
-                send_message(phone, "Entendido! Si cambias de opinion escribe *hola* cuando quieras 😊")
-            else:
-                enviar_botones(phone,
-                    "¿Confirmas tu compra de Game Pass Ultimate - " + conversaciones[phone].get("meses", "") + "?",
-                    [
-                        {"id": "confirmar_compra", "titulo": "✅ Sí, confirmo"},
-                        {"id": "cancelar_compra", "titulo": "❌ Cancelar"}
-                    ]
+            elif text == "consola_no":
+                monto_rsv = PRECIOS_GAMEPASS.get(meses)
+                link_rsv, ref_rsv = (None, None)
+                try:
+                    if monto_rsv:
+                        link_rsv, ref_rsv = crear_link_pago(phone, "Reserva Game Pass Ultimate - " + meses, monto_rsv)
+                except Exception as e:
+                    print("Error creando link de reserva: " + str(e))
+                if ref_rsv:
+                    conversaciones[phone]["referencia_pago"] = ref_rsv
+                    conversaciones[phone]["tipo_pago_pendiente"] = "reserva"
+                conversaciones[phone]["estado"] = "esperando_comprobante"
+
+                send_message(phone,
+                    "Sin problema! 🎮 Puedes pagar ahora para *apartar* tu plan de " + meses + ".\n\n"
+                    "Apenas tengas tu consola o PC disponible y nos avises, te entregamos tu cuenta al instante.\n\n"
+                    + mensaje_opciones_pago(link_rsv)
                 )
+                send_message(ADMIN_PHONE,
+                    "📌 RESERVA Game Line Col\nCliente: +" + phone + "\nPlan: " + meses +
+                    "\n\nEl cliente aun no tiene consola/PC disponible. Pago pendiente para apartar el cupo."
+                )
+            else:
+                enviar_pregunta_consola(phone)
             return jsonify({"status": "ok"}), 200
 
         # ── RENOVACIÓN ───────────────────────────────────────────────────────
@@ -1456,6 +1570,73 @@ def webhook():
 
         if estado == "esperando_pago_final":
             send_message(phone, "Cuando hayas pagado, envianos la foto del comprobante aqui 📸")
+            return jsonify({"status": "ok"}), 200
+
+        if estado == "esperando_comprobante":
+            send_message(phone, "Cuando hayas pagado la reserva, envianos la foto del comprobante aqui 📸")
+            return jsonify({"status": "ok"}), 200
+
+        if estado == "comprobante_reserva_enviado":
+            send_message(phone, "Ya recibimos el comprobante de tu reserva, un asesor lo esta confirmando ⏳")
+            return jsonify({"status": "ok"}), 200
+
+        # ── CLIENTE CON RESERVA PAGADA CONFIRMA QUE YA TIENE CONSOLA/PC ─────
+        if estado == "esperando_consola":
+            confirmaciones_consola = (
+                "consola_lista", "si", "sí", "ya", "yes", "listo", "lista",
+                "ya tengo", "ya la tengo", "tengo consola", "ya llegue", "ya llegué"
+            )
+            if text_lower in confirmaciones_consola:
+                meses = conversaciones[phone].get("meses", "1 mes")
+                asignacion = asignar_cuenta(phone)
+                if not asignacion:
+                    send_message(phone,
+                        "Uy, justo ahorita no tenemos disponibilidad 😔\n\n"
+                        "Ya avisamos a un asesor para resolverlo lo antes posible, tu reserva sigue vigente."
+                    )
+                    send_message(ADMIN_PHONE,
+                        "🚨 URGENTE - Sin stock para reserva ya pagada\nCliente +" + phone +
+                        " confirmo que ya tiene consola (" + meses + ") pero no hay cuentas disponibles. Resolver manualmente."
+                    )
+                    return jsonify({"status": "ok"}), 200
+
+                email_asig, password_asig, tipo_asig = asignacion
+                conversaciones[phone]["tipo_cuenta"] = tipo_asig
+                conversaciones[phone]["email_cuenta"] = email_asig
+                conversaciones[phone]["estado"] = "pago_confirmado"
+                conversaciones[phone]["compro"] = True
+
+                config_asig = CONFIG_PRINCIPAL if tipo_asig == "Principal" else CONFIG_SECUNDARIA
+
+                send_message(phone,
+                    "✅ Perfecto! Tu cuenta de Game Pass Ultimate ha sido asignada! 🎮\n\n"
+                    "📅 Plan: " + meses + " - Cuenta " + tipo_asig + "\n\n"
+                    "📧 *Email:* " + email_asig + "\n"
+                    "🔒 *Contraseña:* " + password_asig
+                )
+                send_message(phone,
+                    "PASO 1 - AGREGAR LA CUENTA EN TU CONSOLA:\n\n"
+                    "1️⃣ Ve a *Agregar nueva cuenta*\n"
+                    "2️⃣ Ingresa el *email y contraseña* que te compartimos arriba\n"
+                    "3️⃣ Sigue la configuracion a continuacion 👇"
+                )
+                send_message(phone, "CONFIGURACION DE TU CUENTA:\n\n" + config_asig)
+                send_message(phone, CIERRE)
+
+                send_message(ADMIN_PHONE,
+                    "🎮 RESERVA ENTREGADA Game Line Col\n"
+                    "Cliente: +" + phone + "\nPlan: " + meses + " - Cuenta " + tipo_asig +
+                    "\n\n📧 Email: " + email_asig +
+                    "\n🔒 Contraseña: " + password_asig +
+                    "\n\nYa estaba pagada. Verifica que la cuenta este canjeada antes de que el cliente la use."
+                )
+
+                registrar_compra(phone, tipo_asig, meses, email_asig)
+                registrar_evento_diario("cierres")
+            else:
+                enviar_boton_consola_lista(phone,
+                    "Avisanos aqui cuando tengas tu consola o PC disponible para entregarte tu cuenta 🎮"
+                )
             return jsonify({"status": "ok"}), 200
 
         if text == "1" or ("game pass" in text_lower and estado == "menu"):
@@ -1749,8 +1930,13 @@ def mercadopago_webhook():
                     tipo_pago = datos_cliente.get("tipo_pago_pendiente")
 
                     if tipo_pago == "reserva":
-                        conversaciones[phone_pagador]["estado"] = "esperando_codigo_apartado"
-                        send_message(phone_pagador, "✅ Pago de tu reserva confirmado automaticamente!\n\nCuando tengas tu consola disponible envianos el codigo de activacion aqui 🎮")
+                        conversaciones[phone_pagador]["estado"] = "esperando_consola"
+                        conversaciones[phone_pagador]["reserva_pagada"] = True
+                        conversaciones[phone_pagador]["recordatorio_consola_at"] = time.time() + HORA_RECORDATORIO_CONSOLA
+                        enviar_boton_consola_lista(phone_pagador,
+                            "✅ Pago de tu reserva confirmado automaticamente!\n\n"
+                            "Cuando tengas tu consola o PC disponible, avisanos aqui para entregarte tu cuenta al instante 🎮"
+                        )
                         etiqueta_mp = "RESERVA"
                         registrar_evento_diario("reservas")
                     else:
