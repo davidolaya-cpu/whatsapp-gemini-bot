@@ -2,8 +2,10 @@ import os
 import re
 import json
 import requests
+import smtplib
 import threading
 import time
+from email.mime.text import MIMEText
 from datetime import datetime
 from flask import Flask, request, jsonify
 from google import genai
@@ -25,8 +27,66 @@ ADMIN_PHONE = "573229082927"
 HORA_SEGUIMIENTO = 3600
 HORA_RECORDATORIO_CONSOLA = 86400  # 24h para recordarle al cliente que avise cuando tenga consola
 
+# Alerta por correo cuando el token de WhatsApp deja de funcionar (no se puede
+# avisar por WhatsApp porque justo ese canal es el que fallo).
+EMAIL_ADDRESS = os.environ.get("EMAIL_ADDRESS")
+EMAIL_APP_PASSWORD = os.environ.get("EMAIL_APP_PASSWORD")
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", EMAIL_ADDRESS)
+ALERTA_TOKEN_COOLDOWN = 1800  # 30 min entre alertas para no saturar el correo
+_ultima_alerta_token = {"ts": 0}
+
 _flood_control = {}  # {phone: ultimo_timestamp_procesado}
 _sheets_errores_consecutivos = 0
+
+# Numeros bloqueados: el bot ignora todo lo que llegue de ellos y nunca les
+# envia mensajes. Se persiste en la hoja "Bloqueados" del Sheet.
+bloqueados = {}  # {phone: {"motivo": str, "fecha": str}}
+
+
+def enviar_alerta_email(asunto, cuerpo):
+    if not EMAIL_ADDRESS or not EMAIL_APP_PASSWORD or not ADMIN_EMAIL:
+        print("⚠️ No se pudo enviar alerta por correo: faltan EMAIL_ADDRESS / EMAIL_APP_PASSWORD / ADMIN_EMAIL en las variables de entorno de Railway.")
+        return
+    try:
+        msg = MIMEText(cuerpo)
+        msg["Subject"] = asunto
+        msg["From"] = EMAIL_ADDRESS
+        msg["To"] = ADMIN_EMAIL
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as servidor:
+            servidor.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
+            servidor.send_message(msg)
+        print("📧 Alerta por correo enviada a " + ADMIN_EMAIL)
+    except Exception as e:
+        print("Error enviando alerta por correo: " + str(e))
+
+
+def es_error_token(data):
+    # Detecta si una respuesta de la API de WhatsApp/Meta indica un token
+    # invalido, vencido o revocado (codigo 190 = OAuthException clasico).
+    if not isinstance(data, dict):
+        return False
+    error = data.get("error", {})
+    if not isinstance(error, dict):
+        return False
+    codigo = error.get("code")
+    tipo = str(error.get("type", ""))
+    mensaje = str(error.get("message", "")).lower()
+    return codigo == 190 or tipo == "OAuthException" or "access token" in mensaje
+
+
+def alertar_token_vencido(detalle):
+    ahora = time.time()
+    if ahora - _ultima_alerta_token["ts"] < ALERTA_TOKEN_COOLDOWN:
+        return
+    _ultima_alerta_token["ts"] = ahora
+    print("🚨 TOKEN DE WHATSAPP INVALIDO/VENCIDO: " + str(detalle))
+    enviar_alerta_email(
+        "🚨 Game Line Col - El token de WhatsApp dejo de funcionar",
+        "El bot detecto que el token de acceso de WhatsApp (Meta) ya no es valido.\n\n"
+        "El bot NO puede enviar ni recibir mensajes de WhatsApp hasta que generes un token nuevo "
+        "(System User, sin expiracion) y lo actualices en la variable de entorno WHATSAPP_TOKEN en Railway.\n\n"
+        "Detalle tecnico:\n" + str(detalle)
+    )
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -278,6 +338,115 @@ def cargar_config():
         print("Error cargando config: " + str(e))
 
 
+def normalizar_numero(texto):
+    # Convierte "+57 322 908 2927", "322 908 2927" o "573229082927" al formato
+    # que usa WhatsApp internamente: 573229082927 (sin + ni espacios).
+    digitos = re.sub(r"\D", "", str(texto or ""))
+    if not digitos:
+        return ""
+    if len(digitos) == 10 and digitos.startswith("3"):
+        digitos = "57" + digitos  # celular colombiano sin indicativo
+    return digitos
+
+
+def cargar_bloqueados():
+    global bloqueados
+    try:
+        service = get_sheets_service()
+        result = service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID, range="Bloqueados!A:C"
+        ).execute()
+        filas = result.get("values", [])
+        nuevos = {}
+        for fila in filas[1:]:
+            if fila and fila[0].strip():
+                telefono = normalizar_numero(fila[0])
+                if not telefono:
+                    continue
+                nuevos[telefono] = {
+                    "motivo": fila[1] if len(fila) > 1 else "",
+                    "fecha": fila[2] if len(fila) > 2 else ""
+                }
+        bloqueados = nuevos
+        print("Numeros bloqueados cargados: " + str(len(bloqueados)))
+    except Exception as e:
+        print("Error cargando bloqueados: " + str(e))
+
+
+def guardar_bloqueados():
+    try:
+        service = get_sheets_service()
+        asegurar_hoja("Bloqueados")
+        filas = [["Teléfono", "Motivo", "Fecha de bloqueo"]]
+        for telefono, datos in bloqueados.items():
+            filas.append([telefono, datos.get("motivo", ""), datos.get("fecha", "")])
+        service.spreadsheets().values().clear(
+            spreadsheetId=SHEET_ID, range="Bloqueados!A:C"
+        ).execute()
+        service.spreadsheets().values().update(
+            spreadsheetId=SHEET_ID,
+            range="Bloqueados!A1",
+            valueInputOption="RAW",
+            body={"values": filas}
+        ).execute()
+    except Exception as e:
+        print("Error guardando bloqueados: " + str(e))
+
+
+def esta_bloqueado(phone):
+    if phone == ADMIN_PHONE:
+        return False  # jamas bloqueamos al admin, seria quedarse sin control
+    return normalizar_numero(phone) in bloqueados
+
+
+def bloquear_numero(phone, motivo=""):
+    telefono = normalizar_numero(phone)
+    if not telefono:
+        return False, "Numero invalido."
+    if telefono == normalizar_numero(ADMIN_PHONE):
+        return False, "No puedes bloquear el numero del administrador."
+    if telefono in bloqueados:
+        return False, "El numero +" + telefono + " ya estaba bloqueado."
+
+    bloqueados[telefono] = {
+        "motivo": motivo or "Sin motivo especificado",
+        "fecha": datetime.now().strftime("%d/%m/%Y %H:%M")
+    }
+    guardar_bloqueados()
+
+    # Liberar recursos que tuviera ocupados el cliente bloqueado.
+    detalles = []
+    try:
+        tenia_cuenta = any(
+            c.get("cliente_principal") == telefono or c.get("cliente_secundaria") == telefono
+            for c in cuentas
+        )
+        if tenia_cuenta:
+            liberar_cuenta(telefono)
+            detalles.append("cuenta del inventario liberada")
+    except Exception as e:
+        print("Error liberando cuenta al bloquear: " + str(e))
+    if telefono in conversaciones:
+        del conversaciones[telefono]
+        detalles.append("conversacion eliminada")
+    if telefono in renovaciones:
+        del renovaciones[telefono]
+        guardar_renovaciones()
+        detalles.append("renovacion cancelada")
+
+    extra = (" (" + ", ".join(detalles) + ")") if detalles else ""
+    return True, "🚫 Numero +" + telefono + " bloqueado" + extra + "."
+
+
+def desbloquear_numero(phone):
+    telefono = normalizar_numero(phone)
+    if telefono not in bloqueados:
+        return False, "El numero +" + str(telefono) + " no estaba bloqueado."
+    del bloqueados[telefono]
+    guardar_bloqueados()
+    return True, "✅ Numero +" + telefono + " desbloqueado. Ya puede escribirle al bot."
+
+
 def guardar_renovaciones():
     try:
         service = get_sheets_service()
@@ -360,6 +529,9 @@ def registrar_compra(phone, tipo_cuenta, meses, email_cuenta=""):
 
 
 def send_message(phone, message, intentos=3):
+    if esta_bloqueado(phone):
+        return False
+
     url = "https://graph.facebook.com/v18.0/" + PHONE_NUMBER_ID + "/messages"
     headers = {
         "Authorization": "Bearer " + WHATSAPP_TOKEN,
@@ -379,6 +551,9 @@ def send_message(phone, message, intentos=3):
             if r.status_code < 400:
                 return ultimo_resultado
             print("WhatsApp error (intento " + str(intento + 1) + "): " + str(ultimo_resultado))
+            if es_error_token(ultimo_resultado):
+                alertar_token_vencido(ultimo_resultado)
+                break
         except Exception as e:
             print("Error enviando mensaje (intento " + str(intento + 1) + "): " + str(e))
         time.sleep(2)
@@ -386,6 +561,9 @@ def send_message(phone, message, intentos=3):
 
 
 def enviar_template(phone, nombre_plantilla, idioma="es_CO", parametros=None, intentos=3):
+    if esta_bloqueado(phone):
+        return False
+
     # A diferencia de send_message, esto SI funciona aunque hayan pasado mas de 24h
     # desde el ultimo mensaje del cliente, porque usa una plantilla pre-aprobada por Meta.
     # 'parametros' es una lista de textos para llenar las variables {{1}}, {{2}}... del
@@ -416,6 +594,9 @@ def enviar_template(phone, nombre_plantilla, idioma="es_CO", parametros=None, in
             if r.status_code < 400:
                 return ultimo_resultado
             print("Error enviando plantilla (intento " + str(intento + 1) + "): " + str(ultimo_resultado))
+            if es_error_token(ultimo_resultado):
+                alertar_token_vencido(ultimo_resultado)
+                break
         except Exception as e:
             print("Error enviando plantilla (intento " + str(intento + 1) + "): " + str(e))
         time.sleep(2)
@@ -423,6 +604,9 @@ def enviar_template(phone, nombre_plantilla, idioma="es_CO", parametros=None, in
 
 
 def reenviar_imagen(phone, media_id, caption="", intentos=2):
+    if esta_bloqueado(phone):
+        return False
+
     url = "https://graph.facebook.com/v18.0/" + PHONE_NUMBER_ID + "/messages"
     headers = {
         "Authorization": "Bearer " + WHATSAPP_TOKEN,
@@ -443,6 +627,9 @@ def reenviar_imagen(phone, media_id, caption="", intentos=2):
             if r.status_code < 400:
                 return data
             print("Error reenviando imagen (intento " + str(intento + 1) + "): " + str(data))
+            if es_error_token(data):
+                alertar_token_vencido(data)
+                break
         except Exception as e:
             print("Error reenviando imagen (intento " + str(intento + 1) + "): " + str(e))
         time.sleep(2)
@@ -451,6 +638,9 @@ def reenviar_imagen(phone, media_id, caption="", intentos=2):
 
 
 def enviar_botones(phone, cuerpo, botones, intentos=3):
+    if esta_bloqueado(phone):
+        return False
+
     url = "https://graph.facebook.com/v18.0/" + PHONE_NUMBER_ID + "/messages"
     headers = {
         "Authorization": "Bearer " + WHATSAPP_TOKEN,
@@ -477,6 +667,9 @@ def enviar_botones(phone, cuerpo, botones, intentos=3):
             if r.status_code < 400:
                 return data
             print("Error enviando botones (intento " + str(intento + 1) + "): " + str(data))
+            if es_error_token(data):
+                alertar_token_vencido(data)
+                break
         except Exception as e:
             print("Error enviando botones (intento " + str(intento + 1) + "): " + str(e))
         time.sleep(2)
@@ -484,6 +677,9 @@ def enviar_botones(phone, cuerpo, botones, intentos=3):
 
 
 def enviar_lista(phone, cuerpo, texto_boton, filas, titulo_seccion="Opciones", intentos=3):
+    if esta_bloqueado(phone):
+        return False
+
     url = "https://graph.facebook.com/v18.0/" + PHONE_NUMBER_ID + "/messages"
     headers = {
         "Authorization": "Bearer " + WHATSAPP_TOKEN,
@@ -512,6 +708,9 @@ def enviar_lista(phone, cuerpo, texto_boton, filas, titulo_seccion="Opciones", i
             if r.status_code < 400:
                 return data
             print("Error enviando lista (intento " + str(intento + 1) + "): " + str(data))
+            if es_error_token(data):
+                alertar_token_vencido(data)
+                break
         except Exception as e:
             print("Error enviando lista (intento " + str(intento + 1) + "): " + str(e))
         time.sleep(2)
@@ -519,6 +718,9 @@ def enviar_lista(phone, cuerpo, texto_boton, filas, titulo_seccion="Opciones", i
 
 
 def enviar_documento(phone, media_id, caption="", nombre_archivo="Catalogo_Game_Line_Col.pdf", intentos=3):
+    if esta_bloqueado(phone):
+        return False
+
     url = "https://graph.facebook.com/v18.0/" + PHONE_NUMBER_ID + "/messages"
     headers = {
         "Authorization": "Bearer " + WHATSAPP_TOKEN,
@@ -541,6 +743,9 @@ def enviar_documento(phone, media_id, caption="", nombre_archivo="Catalogo_Game_
             if r.status_code < 400:
                 return data
             print("Error enviando documento (intento " + str(intento + 1) + "): " + str(data))
+            if es_error_token(data):
+                alertar_token_vencido(data)
+                break
         except Exception as e:
             print("Error enviando documento (intento " + str(intento + 1) + "): " + str(e))
         time.sleep(2)
@@ -551,7 +756,9 @@ def enviar_documento(phone, media_id, caption="", nombre_archivo="Catalogo_Game_
 def descargar_media(media_id):
     url = "https://graph.facebook.com/v18.0/" + media_id
     headers = {"Authorization": "Bearer " + WHATSAPP_TOKEN}
-    info = requests.get(url, headers=headers).json()
+    info = requests.get(url, headers=headers, timeout=10).json()
+    if es_error_token(info):
+        alertar_token_vencido(info)
     media_url = info.get("url")
     mime_type = info.get("mime_type", "image/jpeg")
     media_resp = requests.get(media_url, headers=headers)
@@ -875,6 +1082,7 @@ asegurar_hoja("Config")
 asegurar_hoja("Compras")
 asegurar_hoja("Renovaciones")
 asegurar_hoja("Cuentas")
+asegurar_hoja("Bloqueados")
 
 
 def inicializar_hojas():
@@ -901,11 +1109,26 @@ def inicializar_hojas():
         print("Error inicializando hojas: " + str(e))
 
 
+def verificar_token_whatsapp():
+    try:
+        url = "https://graph.facebook.com/v18.0/" + str(PHONE_NUMBER_ID)
+        r = requests.get(url, headers={"Authorization": "Bearer " + str(WHATSAPP_TOKEN)}, timeout=10)
+        data = r.json()
+        if es_error_token(data):
+            alertar_token_vencido(data)
+        else:
+            print("✅ Token de WhatsApp verificado correctamente al iniciar.")
+    except Exception as e:
+        print("No se pudo verificar el token de WhatsApp al iniciar: " + str(e))
+
+
+cargar_bloqueados()
 cargar_estados()
 cargar_config()
 cargar_renovaciones()
 cargar_cuentas()
 inicializar_hojas()
+verificar_token_whatsapp()
 threading.Thread(target=scheduler, daemon=True).start()
 
 BIENVENIDA = "🎮 Bienvenido a Game Line Col! 🎮\n\nSomos tu tienda de confianza para juegos y suscripciones Xbox.\n\nEn que te podemos ayudar? 👇"
@@ -1030,6 +1253,12 @@ def webhook():
 
         phone = message["from"]
         msg_id = message.get("id", "")
+
+        # ── Numeros bloqueados: se descarta el mensaje sin responder nada ─────
+        # Devolvemos 200 igual para que Meta no reintente el envio.
+        if esta_bloqueado(phone):
+            print("🚫 Mensaje ignorado de numero bloqueado: +" + phone)
+            return jsonify({"status": "ok"}), 200
 
         # ── Anti-flood: máximo 1 mensaje procesado cada 2 segundos por cliente ─
         if phone != ADMIN_PHONE:
@@ -1260,6 +1489,69 @@ def webhook():
             else:
                 msg = "No hay clientes pendientes en este momento 🎉"
             send_message(ADMIN_PHONE, msg)
+            return jsonify({"status": "ok"}), 200
+
+        # ── Comandos de bloqueo (solo admin) ─────────────────────────────────
+        if phone == ADMIN_PHONE and text_lower.startswith("bloquear"):
+            resto = text[len("bloquear"):].strip()
+            if not resto:
+                send_message(ADMIN_PHONE,
+                    "Uso del comando:\n\n"
+                    "🚫 *bloquear 3229082927 motivo*\n"
+                    "🚫 *bloquear 2927 motivo* (ultimos 4 digitos de un cliente activo)\n\n"
+                    "El motivo es opcional.")
+                return jsonify({"status": "ok"}), 200
+
+            partes = resto.split(None, 1)
+            objetivo = partes[0]
+            motivo = partes[1].strip() if len(partes) > 1 else ""
+
+            # Si solo dio 4 digitos, buscamos el cliente en las conversaciones.
+            solo_digitos = re.sub(r"\D", "", objetivo)
+            if len(solo_digitos) <= 5:
+                candidatos = [ph for ph in conversaciones if ph.endswith(solo_digitos)]
+                if len(candidatos) == 1:
+                    objetivo = candidatos[0]
+                elif len(candidatos) > 1:
+                    send_message(ADMIN_PHONE,
+                        "Hay varios clientes que terminan en " + solo_digitos + ":\n\n" +
+                        "\n".join("+" + c for c in candidatos) +
+                        "\n\nEnvia el numero completo para bloquear el correcto.")
+                    return jsonify({"status": "ok"}), 200
+                else:
+                    send_message(ADMIN_PHONE,
+                        "No encontre ningun cliente que termine en " + solo_digitos +
+                        ". Envia el numero completo.")
+                    return jsonify({"status": "ok"}), 200
+
+            ok, respuesta = bloquear_numero(objetivo, motivo)
+            if ok and motivo:
+                respuesta += "\nMotivo: " + motivo
+            send_message(ADMIN_PHONE, respuesta)
+            return jsonify({"status": "ok"}), 200
+
+        if phone == ADMIN_PHONE and text_lower.startswith("desbloquear"):
+            objetivo = text[len("desbloquear"):].strip()
+            if not objetivo:
+                send_message(ADMIN_PHONE, "Uso: *desbloquear 3229082927*")
+                return jsonify({"status": "ok"}), 200
+            ok, respuesta = desbloquear_numero(objetivo)
+            send_message(ADMIN_PHONE, respuesta)
+            return jsonify({"status": "ok"}), 200
+
+        if phone == ADMIN_PHONE and text_lower == "bloqueados":
+            if not bloqueados:
+                send_message(ADMIN_PHONE, "No hay numeros bloqueados en este momento ✅")
+            else:
+                lineas = []
+                for telefono, datos in bloqueados.items():
+                    lineas.append(
+                        "+" + telefono + " - " + str(datos.get("motivo", "")) +
+                        " (" + str(datos.get("fecha", "")) + ")"
+                    )
+                send_message(ADMIN_PHONE,
+                    "🚫 Numeros bloqueados (" + str(len(bloqueados)) + "):\n\n" + "\n".join(lineas) +
+                    "\n\nPara quitar uno: *desbloquear <numero>*")
             return jsonify({"status": "ok"}), 200
 
         saludos = ["hola", "buenas", "buenos dias", "buenas tardes", "buenas noches", "hi", "hello", "inicio"]
