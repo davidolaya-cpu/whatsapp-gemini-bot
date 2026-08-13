@@ -24,6 +24,7 @@ MP_ACCESS_TOKEN = os.environ.get("MP_ACCESS_TOKEN")
 MP_NOTIFICATION_URL = os.environ.get("MP_NOTIFICATION_URL")
 SHEET_ID = "1lvIlK1LYbT68HsuDTbMRzWSYh_RGUPHAZeV31_sAmdU"
 ADMIN_PHONE = "573229082927"
+ADMIN_PHONE_DISPLAY = "+57 322 908 2927"
 HORA_SEGUIMIENTO = 3600
 HORA_RECORDATORIO_CONSOLA = 86400  # 24h para recordarle al cliente que avise cuando tenga consola
 
@@ -813,9 +814,79 @@ def mensaje_opciones_pago(link):
     if link:
         texto += "💳 Tarjeta, PSE o Nequi por Mercado Pago (confirmacion automatica):\n" + link + "\n\n"
     texto += ("📲 Nequi: 3057059517\n📲 Daviplata: 3057059517\n🏦 Llave: 3057059517 (David Olaya)\n\n"
-              "Si pagas directo por Nequi/Daviplata/Llave, envianos la foto del comprobante aqui 📸. "
-              "Si usas el link de Mercado Pago, lo confirmamos automaticamente.")
+              "📸 IMPORTANTE: si pagas por Nequi, Daviplata o Llave, envia la foto del comprobante "
+              "*directamente al WhatsApp de nuestro asesor:* " + ADMIN_PHONE_DISPLAY + "\n\n"
+              "Cuando ya lo hayas enviado, escribe aqui *listo* para continuar 👍\n\n"
+              "Si usas el link de Mercado Pago, lo confirmamos automaticamente y no necesitas enviar nada.")
     return texto
+
+
+# Mensaje corto reutilizable para recordarle al cliente a donde va el comprobante.
+RECORDAR_COMPROBANTE_ADMIN = (
+    "📸 Recuerda: la foto del comprobante debes enviarla *directamente* al WhatsApp "
+    "de nuestro asesor " + ADMIN_PHONE_DISPLAY + "\n\n"
+    "Cuando ya lo hayas enviado, escribe aqui *listo* para continuar 👍"
+)
+
+# Frases con las que el cliente nos avisa que ya pago y ya mando el comprobante.
+CONFIRMACIONES_PAGO = (
+    "listo", "listo!", "ya", "ya envie", "ya envié", "ya lo envie", "ya lo envié",
+    "ya te envie", "ya te envié", "ya lo mande", "ya lo mandé", "ya mande", "ya mandé",
+    "enviado", "ya pague", "ya pagué", "ya lo pague", "ya lo pagué", "pagado",
+    "ya esta", "ya está", "hecho", "ok listo"
+)
+
+
+def avanzar_tras_pago(phone, estado):
+    """El cliente avisa que ya pago y que ya envio el comprobante al asesor.
+    El bot avanza el flujo solo (ya no se espera el comando pagook/reservaok).
+    Devuelve True si efectivamente avanzo el estado."""
+
+    # ── Reserva pagada: pasa a esperar que tenga la consola disponible ────────
+    if estado in ("esperando_comprobante", "comprobante_reserva_enviado"):
+        conversaciones[phone]["estado"] = "esperando_consola"
+        conversaciones[phone]["reserva_pagada"] = True
+        conversaciones[phone]["recordatorio_consola_at"] = time.time() + HORA_RECORDATORIO_CONSOLA
+        registrar_evento_diario("reservas")
+        enviar_boton_consola_lista(phone,
+            "✅ Perfecto, gracias!\n\n"
+            "Cuando tengas tu consola o PC disponible, avisanos aqui para entregarte tu cuenta al instante 🎮"
+        )
+        send_message(ADMIN_PHONE,
+            "💰 RESERVA - El cliente +" + phone + " (..." + phone[-4:] + ") dice que ya pago "
+            "y que te envio el comprobante a tu WhatsApp.\n\n"
+            "Plan: " + str(conversaciones[phone].get("meses")) + "\n\n"
+            "⚠️ Verifica el comprobante en tu chat. El bot ya lo dejo esperando consola.\n"
+            "Si el pago NO llego: *anular " + phone[-4:] + "*"
+        )
+        return True
+
+    # ── Pago final o renovacion: se cierra la venta ───────────────────────────
+    if estado in ("esperando_pago_final", "pago_final_enviado",
+                  "renovacion_espera_pago", "renovacion_comprobante_enviado"):
+        tipo_cuenta_c = conversaciones[phone].get("tipo_cuenta", "No especificado")
+        meses_c = conversaciones[phone].get("meses", "No especificado")
+        email_c = conversaciones[phone].get("email_cuenta", "")
+        es_renovacion = conversaciones[phone].get("es_renovacion", False)
+
+        conversaciones[phone]["estado"] = "pago_confirmado"
+        send_message(phone, CIERRE)
+        registrar_compra(phone, tipo_cuenta_c, meses_c, email_c)
+        registrar_evento_diario("cierres")
+        if es_renovacion and phone in renovaciones:
+            renovaciones[phone]["notificado"] = False
+
+        etiqueta = "RENOVACION" if es_renovacion else "PAGO FINAL"
+        send_message(ADMIN_PHONE,
+            "💰 " + etiqueta + " - El cliente +" + phone + " (..." + phone[-4:] + ") dice que ya pago "
+            "y que te envio el comprobante a tu WhatsApp.\n\n"
+            "Plan: " + str(meses_c) + " - " + str(tipo_cuenta_c) + "\n\n"
+            "⚠️ Verifica el comprobante en tu chat. El bot ya registro la compra y cerro la venta.\n"
+            "Si el pago NO llego: *anular " + phone[-4:] + "*"
+        )
+        return True
+
+    return False
 
 
 def leer_comprobante(media_bytes, mime_type):
@@ -1031,7 +1102,8 @@ def scheduler():
                 send_message(phone,
                     "⏰ Recordatorio Game Line Col\n\n"
                     "Tu renovacion de Game Pass" + (" " + meses_rv if meses_rv else "") + " sigue pendiente de pago.\n\n"
-                    "Cuando hayas pagado envianos la foto del comprobante aqui 📸"
+                    "Cuando hayas pagado envia la foto del comprobante al WhatsApp de nuestro asesor "
+                    + ADMIN_PHONE_DISPLAY + " y escribe *listo* aqui 📸"
                 )
                 conversaciones[phone]["renovacion_recordatorio_enviado"] = True
 
@@ -1160,11 +1232,11 @@ ESTADO_CLIENTE_MENSAJE = {
     "seleccion_cuenta": "Estamos esperando que elijas el tipo de cuenta (Principal o Secundaria).",
     "preguntar_consola": "Estamos esperando que nos digas si tienes tu consola o PC disponible ahora.",
     "activacion": "Estamos esperando el codigo de activacion de tu consola. Envialo aqui cuando lo tengas 🎮",
-    "esperando_comprobante": "Estamos esperando el comprobante de pago de tu reserva 📸",
-    "comprobante_reserva_enviado": "Recibimos el comprobante de tu reserva, un asesor lo esta confirmando ⏳",
+    "esperando_comprobante": "Estamos esperando que pagues tu reserva y envies el comprobante al asesor " + ADMIN_PHONE_DISPLAY + ". Cuando lo hagas escribe *listo* 📸",
+    "comprobante_reserva_enviado": "Envia el comprobante de tu reserva al asesor " + ADMIN_PHONE_DISPLAY + " y escribe *listo* aqui ⏳",
     "esperando_consola": "Tu reserva esta confirmada ✅. Avisanos aqui cuando tengas tu consola o PC disponible para entregarte tu cuenta 🎮",
-    "esperando_pago_final": "Tu cuenta ya esta activada 🎮. Estamos esperando el comprobante del pago final 📸",
-    "pago_final_enviado": "Recibimos tu comprobante de pago final, un asesor lo esta confirmando ⏳",
+    "esperando_pago_final": "Tu cuenta ya esta activada 🎮. Envia el comprobante del pago final al asesor " + ADMIN_PHONE_DISPLAY + " y escribe *listo* aqui 📸",
+    "pago_final_enviado": "Envia el comprobante de tu pago final al asesor " + ADMIN_PHONE_DISPLAY + " y escribe *listo* aqui ⏳",
     "pago_confirmado": "Tu pedido esta cerrado y confirmado. Gracias por tu compra! 🎮🙌",
     "juegos": "Estamos esperando que nos digas el nombre del juego que buscas.",
     "soporte": "Tu solicitud de soporte fue enviada, un asesor te contactara pronto 😊",
@@ -1173,6 +1245,7 @@ ESTADO_CLIENTE_MENSAJE = {
     "sop_online_p1": "Revisando Xbox Principal. Dinos el estado de la casilla.",
     "sop_online_p2": "Aplicando solucion paso 1. Prueba el online y cuentanos como te fue.",
     "sop_online_p3": "Aplicando solucion de facturacion. Prueba el online y cuentanos como te fue.",
+    "sop_online_p4": "Aplicando el reinicio completo de configuracion de tu consola. Sigue los 6 pasos y cuentanos como te fue.",
     "sop_online_s1": "Aplicando solucion de facturacion para cuenta Secundaria. Prueba y cuentanos.",
     "sop_jugando": "Diagnosticando problema de otro usuario jugando. Elige el tipo de cuenta.",
     "sop_jugando_p1": "Aplicando solucion para cuenta Principal. Prueba y cuentanos como te fue.",
@@ -1181,8 +1254,8 @@ ESTADO_CLIENTE_MENSAJE = {
     "renovacion_pendiente": "Te preguntamos si quieres renovar tu servicio. Usa los botones para responder.",
     "renovacion_espera_admin": "Tu solicitud de renovacion fue enviada al asesor, en breve te respondemos 🙏",
     "renovacion_espera_tiempo": "Dinos en cuanto tiempo puedes hacer el pago (ej: 30 minutos, 1 hora).",
-    "renovacion_espera_pago": "Estamos esperando tu comprobante de pago para la renovacion 📸",
-    "renovacion_comprobante_enviado": "Recibimos tu comprobante de renovacion, un asesor lo esta confirmando ⏳"
+    "renovacion_espera_pago": "Envia el comprobante de tu renovacion al asesor " + ADMIN_PHONE_DISPLAY + " y escribe *listo* aqui 📸",
+    "renovacion_comprobante_enviado": "Envia el comprobante de tu renovacion al asesor " + ADMIN_PHONE_DISPLAY + " y escribe *listo* aqui ⏳"
 }
 
 
@@ -1491,6 +1564,45 @@ def webhook():
             send_message(ADMIN_PHONE, msg)
             return jsonify({"status": "ok"}), 200
 
+        # ── Revertir un avance automatico cuando el pago NO llego ────────────
+        if phone == ADMIN_PHONE and text_lower.startswith("anular"):
+            ultimos_4 = re.sub(r"\D", "", text_lower.replace("anular", ""))
+            cliente_encontrado = None
+            for ph, datos in conversaciones.items():
+                if ph.endswith(ultimos_4) and datos.get("estado") in (
+                    "esperando_consola", "pago_confirmado"
+                ):
+                    cliente_encontrado = ph
+                    break
+
+            if not cliente_encontrado:
+                send_message(ADMIN_PHONE,
+                    "No encontre un cliente con avance reciente con esos ultimos 4 digitos: " + ultimos_4)
+                return jsonify({"status": "ok"}), 200
+
+            datos_c = conversaciones[cliente_encontrado]
+            if datos_c.get("estado") == "esperando_consola":
+                datos_c["estado"] = "esperando_comprobante"
+                datos_c["reserva_pagada"] = False
+                datos_c["recordatorio_consola_at"] = None
+                aviso_admin = "Volvio a esperar el comprobante de la reserva."
+            else:
+                if datos_c.get("es_renovacion"):
+                    datos_c["estado"] = "renovacion_espera_pago"
+                else:
+                    datos_c["estado"] = "esperando_pago_final"
+                aviso_admin = ("Volvio a esperar el pago final.\n"
+                               "⚠️ Recuerda borrar la fila en la hoja *Compras* si ya se registro.")
+
+            send_message(cliente_encontrado,
+                "Hola! 👋 No logramos encontrar tu pago registrado.\n\n"
+                "Por favor verifica el comprobante y envialo al WhatsApp de nuestro asesor "
+                + ADMIN_PHONE_DISPLAY + " para poder continuar 🙏"
+            )
+            send_message(ADMIN_PHONE,
+                "↩️ Avance anulado para +" + cliente_encontrado + ".\n" + aviso_admin)
+            return jsonify({"status": "ok"}), 200
+
         # ── Comandos de bloqueo (solo admin) ─────────────────────────────────
         if phone == ADMIN_PHONE and text_lower.startswith("bloquear"):
             resto = text[len("bloquear"):].strip()
@@ -1642,37 +1754,16 @@ def webhook():
         tipo_cuenta = conversaciones[phone].get("tipo_cuenta", "No especificado")
 
         if msg_type == "image":
-            if estado in ("esperando_pago_final", "pago_final_enviado", "renovacion_espera_pago", "esperando_comprobante"):
-                media_id = message["image"]["id"]
-                try:
-                    media_bytes, mime_type = descargar_media(media_id)
-                    analisis = leer_comprobante(media_bytes, mime_type)
-                except Exception as e:
-                    print("Error procesando imagen: " + str(e))
-                    analisis = "No pude leer el comprobante automaticamente, revisa la imagen manualmente."
-
-                if estado == "renovacion_espera_pago":
-                    conversaciones[phone]["estado"] = "renovacion_comprobante_enviado"
-                    send_message(phone, "Comprobante recibido! Un asesor lo confirmara en breve. Gracias 🎮🙌")
-                    etiqueta = "COMPROBANTE RENOVACION"
-                    comando_confirmacion = "pagook " + phone[-4:]
-                elif estado == "esperando_comprobante":
-                    conversaciones[phone]["estado"] = "comprobante_reserva_enviado"
-                    send_message(phone, "Comprobante recibido! Un asesor confirmara tu reserva en breve. Gracias 🎮🙌")
-                    etiqueta = "COMPROBANTE DE RESERVA"
-                    comando_confirmacion = "reservaok " + phone[-4:]
-                else:
-                    conversaciones[phone]["estado"] = "pago_final_enviado"
-                    send_message(phone, "Comprobante recibido! Un asesor confirmara tu pago en breve. Gracias por tu compra 🎮🙌")
-                    etiqueta = "COMPROBANTE DE PAGO"
-                    comando_confirmacion = "pagook " + phone[-4:]
-
-                reenviar_imagen(ADMIN_PHONE, media_id)
-                alerta = (etiqueta + " Game Line Col\nCliente: +" + phone +
-                          "\nPlan: " + meses + " - " + tipo_cuenta +
-                          "\n\nLectura automatica:\n" + analisis +
-                          "\n\nResponde: " + comando_confirmacion + " para confirmar.")
-                send_message(ADMIN_PHONE, alerta)
+            if estado in ("esperando_pago_final", "pago_final_enviado", "renovacion_espera_pago",
+                          "renovacion_comprobante_enviado", "esperando_comprobante",
+                          "comprobante_reserva_enviado"):
+                # Ya no recibimos comprobantes por el bot: lo mandamos al asesor.
+                send_message(phone,
+                    "Gracias! 🙌 Pero para poder validarlo, el comprobante debe llegarle "
+                    "*directamente a nuestro asesor*.\n\n"
+                    "📸 Reenviale esa misma foto al WhatsApp " + ADMIN_PHONE_DISPLAY
+                )
+                avanzar_tras_pago(phone, estado)
             else:
                 send_message(phone, "Recibimos tu imagen, pero en este momento no la necesitamos. Si tienes alguna duda escribenos 😊")
             return jsonify({"status": "ok"}), 200
@@ -1852,24 +1943,13 @@ def webhook():
             )
             return jsonify({"status": "ok"}), 200
 
-        if estado == "renovacion_espera_pago":
-            send_message(phone, "Cuando hayas pagado, envianos la foto del comprobante aqui 📸")
-            return jsonify({"status": "ok"}), 200
-
-        if estado == "renovacion_comprobante_enviado":
-            send_message(phone, "Ya recibimos tu comprobante, un asesor lo esta confirmando ⏳")
-            return jsonify({"status": "ok"}), 200
-
-        if estado == "esperando_pago_final":
-            send_message(phone, "Cuando hayas pagado, envianos la foto del comprobante aqui 📸")
-            return jsonify({"status": "ok"}), 200
-
-        if estado == "esperando_comprobante":
-            send_message(phone, "Cuando hayas pagado la reserva, envianos la foto del comprobante aqui 📸")
-            return jsonify({"status": "ok"}), 200
-
-        if estado == "comprobante_reserva_enviado":
-            send_message(phone, "Ya recibimos el comprobante de tu reserva, un asesor lo esta confirmando ⏳")
+        if estado in ("renovacion_espera_pago", "renovacion_comprobante_enviado",
+                      "esperando_pago_final", "pago_final_enviado",
+                      "esperando_comprobante", "comprobante_reserva_enviado"):
+            if text_lower.strip() in CONFIRMACIONES_PAGO:
+                avanzar_tras_pago(phone, estado)
+            else:
+                send_message(phone, RECORDAR_COMPROBANTE_ADMIN)
             return jsonify({"status": "ok"}), 200
 
         # ── CLIENTE CON RESERVA PAGADA CONFIRMA QUE YA TIENE CONSOLA/PC ─────
@@ -1952,7 +2032,7 @@ def webhook():
         # ── SOPORTE: botones sop_* (se procesan ANTES que el menú principal) ─
         SOP_IDS = {"sop_online", "sop_online_p", "sop_online_s",
                    "sop_online_p_marcada", "sop_online_p_no_marcada",
-                   "sop_online_p3", "sop_jugando", "sop_jugando_p",
+                   "sop_online_p3", "sop_online_p4", "sop_jugando", "sop_jugando_p",
                    "sop_jugando_s", "sop_password", "sop_resuelto", "sop_asesor"}
 
         # Mapeo de texto libre a IDs de botón para que el bot entienda aunque no toque el botón
@@ -1981,13 +2061,17 @@ def webhook():
                 elif any(p in tl for p in ["no", "desmarcada", "sin marcar"]):
                     if estado == "sop_online_p1":
                         text = "sop_online_p_no_marcada"
-                elif any(p in tl for p in ["funciona", "listo", "ya", "bien", "ok", "resuelto"]):
-                    text = "sop_resuelto"
-                elif any(p in tl for p in ["sigue", "error", "persiste", "todavia", "todavía"]):
+                elif any(p in tl for p in ["sigue", "error", "persiste", "todavia", "todavía",
+                                           "tampoco", "nada", "no funciona", "no sirve",
+                                           "no me funciona", "igual", "sigue igual"]):
                     if estado == "sop_online_p2":
                         text = "sop_online_p3"
+                    elif estado == "sop_online_p3":
+                        text = "sop_online_p4"
                     else:
                         text = "sop_asesor"
+                elif any(p in tl for p in ["funciona", "listo", "ya", "bien", "ok", "resuelto"]):
+                    text = "sop_resuelto"
 
             if text == "sop_online":
                 conversaciones[phone]["estado"] = "sop_online"
@@ -2046,6 +2130,37 @@ def webhook():
                     "Vuelve a probar. Como te fue?"
                 )
                 enviar_botones(phone, "Resultado:", [
+                    {"id": "sop_resuelto", "titulo": "🎉 Ya funciona!"},
+                    {"id": "sop_online_p4", "titulo": "Sigue el error"}
+                ])
+                return jsonify({"status": "ok"}), 200
+
+            if text == "sop_online_p4":
+                conversaciones[phone]["estado"] = "sop_online_p4"
+                send_message(phone,
+                    "Tranquilo, ya sabemos que esta pasando 🙌\n\n"
+                    "Tu cuenta esta perfecta de nuestro lado. Lo que ocurre es que *tu consola* "
+                    "guardo mal la configuracion del servicio online, y hay que reiniciarla por completo.\n\n"
+                    "Es un procedimiento un poco mas largo, pero con este queda resuelto. "
+                    "Sigue los pasos en orden y sin saltarte ninguno 👇"
+                )
+                send_message(phone,
+                    "🎮 *PASOS PARA ACTIVAR CORRECTAMENTE EL SERVICIO ONLINE EN TU XBOX*\n\n"
+                    "1️⃣ Inicia sesion con la *cuenta de Game Pass Ultimate*.\n\n"
+                    "2️⃣ Ve a *Configuracion > Personalizacion > Mi Xbox principal*.\n\n"
+                    "3️⃣ *Desmarca* la opcion \"Mi Xbox principal\", confirma la eliminacion y "
+                    "*reinicia la consola*.\n\n"
+                    "4️⃣ Cuando la consola reinicie, vuelve a iniciar sesion con la *cuenta de Game Pass "
+                    "Ultimate* y repite la ruta:\n"
+                    "*Configuracion > Personalizacion > Mi Xbox principal*\n"
+                    "Esta vez *marca* la opcion \"Mi Xbox principal\" y dejala activada.\n\n"
+                    "5️⃣ Luego ve a *Configuracion > Red > Configuracion avanzada > Direccion MAC "
+                    "alternativa*. Selecciona *Borrar/Limpiar* y *reinicia la consola*.\n\n"
+                    "6️⃣ Al encender nuevamente la consola, inicia sesion *unicamente con tu cuenta "
+                    "personal*. ⚠️ NO inicies sesion con la cuenta de Game Pass Ultimate.\n\n"
+                    "Finalmente, prueba nuevamente el servicio online 🚀"
+                )
+                enviar_botones(phone, "Como te fue?", [
                     {"id": "sop_resuelto", "titulo": "🎉 Ya funciona!"},
                     {"id": "sop_asesor", "titulo": "Sigue el error"}
                 ])
