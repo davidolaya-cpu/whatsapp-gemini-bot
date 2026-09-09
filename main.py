@@ -1,6 +1,8 @@
 import os
 import re
 import json
+import hmac
+import hashlib
 import requests
 import smtplib
 import threading
@@ -22,6 +24,9 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS")
 MP_ACCESS_TOKEN = os.environ.get("MP_ACCESS_TOKEN")
 MP_NOTIFICATION_URL = os.environ.get("MP_NOTIFICATION_URL")
+# App Secret de la app de Meta. Sirve para verificar que cada webhook viene
+# realmente de Meta y no de un tercero que descubrio la URL.
+WHATSAPP_APP_SECRET = os.environ.get("WHATSAPP_APP_SECRET", "")
 SHEET_ID = "1lvIlK1LYbT68HsuDTbMRzWSYh_RGUPHAZeV31_sAmdU"
 ADMIN_PHONE = "573229082927"
 ADMIN_PHONE_DISPLAY = "+57 322 908 2927"
@@ -825,7 +830,8 @@ def mensaje_opciones_pago(link):
 RECORDAR_COMPROBANTE_ADMIN = (
     "📸 Recuerda: la foto del comprobante debes enviarla *directamente* al WhatsApp "
     "de nuestro asesor " + ADMIN_PHONE_DISPLAY + "\n\n"
-    "Cuando ya lo hayas enviado, escribe aqui *listo* para continuar 👍"
+    "Cuando ya lo hayas enviado, escribe aqui *listo* para continuar 👍\n\n"
+    "_Si necesitas otra cosa, escribe *menu*. Si quieres hablar con una persona, escribe *asesor*._"
 )
 
 # Frases con las que el cliente nos avisa que ya pago y ya mando el comprobante.
@@ -1201,9 +1207,23 @@ cargar_renovaciones()
 cargar_cuentas()
 inicializar_hojas()
 verificar_token_whatsapp()
+
+if not WHATSAPP_APP_SECRET:
+    print("=" * 60)
+    print("⚠️  ATENCION: WHATSAPP_APP_SECRET no esta configurado.")
+    print("   El webhook acepta peticiones de CUALQUIER origen.")
+    print("   Configura la variable en Railway para cerrar este hueco.")
+    print("=" * 60)
+else:
+    print("🔒 Verificacion de firma del webhook ACTIVA")
+
 threading.Thread(target=scheduler, daemon=True).start()
 
-BIENVENIDA = "🎮 Bienvenido a Game Line Col! 🎮\n\nSomos tu tienda de confianza para juegos y suscripciones Xbox.\n\nEn que te podemos ayudar? 👇"
+BIENVENIDA = ("🎮 Bienvenido a Game Line Col! 🎮\n\n"
+              "Somos tu tienda de confianza para juegos y suscripciones Xbox.\n\n"
+              "💡 En cualquier momento puedes escribir *menu* para volver al inicio, "
+              "o *asesor* si necesitas hablar con una persona.\n\n"
+              "En que te podemos ayudar? 👇")
 
 GAMEPASS = "🕹️ GAME PASS ULTIMATE\n\nPRECIOS:\n📅 1 mes: $29.900\n📅 2 meses: $55.000\n📅 3 meses: $80.000\n📅 6 meses: $140.000\n📅 12 meses: $190.000\n\nMODALIDADES:\n🏠 Principal: juegas desde tu cuenta sin iniciar sesion en otra\n👤 Secundaria: juegas desde tu cuenta iniciando sesion en la del servicio\n\nAmbas funcionan perfecto, solo cambia la configuracion.\n\nGARANTIA: Primero pruebas y luego pagas."
 
@@ -1312,8 +1332,43 @@ def verify():
     return "Token invalido", 403
 
 
+def firma_valida(raw_body, cabecera_firma):
+    """Verifica que el webhook venga realmente de Meta.
+
+    Meta firma el cuerpo crudo de cada POST con el App Secret y lo manda en la
+    cabecera X-Hub-Signature-256 con el formato 'sha256=<hexdigest>'.
+
+    Si WHATSAPP_APP_SECRET no esta configurado, se deja pasar para no tumbar el
+    bot, pero se avisa en los logs en cada peticion.
+    """
+    if not WHATSAPP_APP_SECRET:
+        print("⚠️ WHATSAPP_APP_SECRET no configurado: el webhook esta ACEPTANDO "
+              "peticiones sin verificar. Configuralo en Railway cuanto antes.")
+        return True
+
+    if not cabecera_firma or not cabecera_firma.startswith("sha256="):
+        return False
+
+    firma_recibida = cabecera_firma.split("=", 1)[1].strip()
+    firma_esperada = hmac.new(
+        WHATSAPP_APP_SECRET.encode("utf-8"),
+        raw_body,
+        hashlib.sha256
+    ).hexdigest()
+
+    # compare_digest evita filtrar informacion por tiempo de comparacion
+    return hmac.compare_digest(firma_recibida, firma_esperada)
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    # ── Verificacion de firma: se hace ANTES de leer el JSON ──────────────────
+    # Hay que usar el cuerpo crudo, byte por byte, tal como lo firmo Meta.
+    if not firma_valida(request.get_data(), request.headers.get("X-Hub-Signature-256", "")):
+        print("🛑 Webhook RECHAZADO: firma invalida o ausente. IP: " +
+              str(request.headers.get("X-Forwarded-For", request.remote_addr)))
+        return jsonify({"status": "forbidden"}), 403
+
     data = request.json
     try:
         value = data["entry"][0]["changes"][0]["value"]
@@ -1696,12 +1751,37 @@ def webhook():
             enviar_menu_principal(phone)
             return jsonify({"status": "ok"}), 200
 
-        # Comando explicito para reiniciar al menu principal a proposito.
-        if text_lower == "menu":
+        # ── Palabras de escape: funcionan desde CUALQUIER estado ──────────────
+        # Es la salida de emergencia cuando el cliente siente que el bot no lo
+        # entiende. Debe ir antes de cualquier logica de estado.
+        PALABRAS_REINICIO = ("menu", "menú", "inicio", "reiniciar", "reinicio", "salir",
+                             "cancelar", "empezar de nuevo", "volver", "atras", "atrás",
+                             "regresar", "empezar", "otra cosa", "menu principal")
+        PALABRAS_ASESOR = ("asesor", "humano", "persona real", "hablar con alguien",
+                           "atencion personal", "atención personal", "agente",
+                           "hablar con una persona", "necesito ayuda de una persona")
+
+        if text_lower.strip() in PALABRAS_REINICIO or text_lower.strip() in ("menu", "menú"):
             conversaciones[phone]["estado"] = "menu"
             conversaciones[phone]["ultima_interaccion"] = time.time()
-            send_message(phone, "Volviendo al menu principal 🎮")
+            conversaciones[phone]["msgs_mismo_estado"] = 0
+            send_message(phone, "Listo, empecemos de nuevo 🎮")
             enviar_menu_principal(phone)
+            return jsonify({"status": "ok"}), 200
+
+        if not text_lower.startswith("sop_") and any(p in text_lower for p in PALABRAS_ASESOR):
+            conversaciones[phone]["estado"] = "soporte_asesor"
+            conversaciones[phone]["ultima_interaccion"] = time.time()
+            send_message(phone,
+                "Claro que si 🙌 Un asesor te va a escribir en breve.\n\n"
+                "Si prefieres escribirle tu directamente, este es su WhatsApp: "
+                + ADMIN_PHONE_DISPLAY + "\n\n"
+                "Y si en algun momento quieres volver al menu, escribe *menu*."
+            )
+            send_message(ADMIN_PHONE,
+                "🙋 El cliente +" + phone + " (..." + phone[-4:] + ") pidio hablar con un asesor.\n"
+                "Estado en el que estaba: " + str(conversaciones[phone].get("estado_anterior_registrado", "desconocido"))
+            )
             return jsonify({"status": "ok"}), 200
 
         # Un saludo NO debe borrar un proceso de compra en curso (esto causaba
@@ -1748,6 +1828,36 @@ def webhook():
         conversaciones[phone]["ultima_interaccion"] = time.time()
         conversaciones[phone]["recordatorio_enviado"] = False
         estado = conversaciones[phone].get("estado", "menu")
+
+        # ── Detector de bucle ────────────────────────────────────────────────
+        # Si el cliente lleva varios mensajes sin que el estado avance, lo mas
+        # probable es que el bot no lo este entendiendo. Le ofrecemos la salida
+        # sin que tenga que adivinar ninguna palabra magica.
+        # "menu" se excluye porque ahi la conversacion libre es normal.
+        if estado == conversaciones[phone].get("estado_anterior_registrado"):
+            conversaciones[phone]["msgs_mismo_estado"] = conversaciones[phone].get("msgs_mismo_estado", 0) + 1
+        else:
+            conversaciones[phone]["estado_anterior_registrado"] = estado
+            conversaciones[phone]["msgs_mismo_estado"] = 1
+
+        if estado != "menu" and conversaciones[phone].get("msgs_mismo_estado", 0) >= 3:
+            conversaciones[phone]["msgs_mismo_estado"] = 0
+            send_message(phone,
+                "Parece que no estoy logrando ayudarte con lo que necesitas 😕\n\n"
+                "Dime como prefieres seguir 👇"
+            )
+            enviar_botones(phone, "Que quieres hacer?", [
+                {"id": "reiniciar_menu", "titulo": "🔄 Volver al menu"},
+                {"id": "sop_asesor", "titulo": "🙋 Hablar con asesor"}
+            ])
+            return jsonify({"status": "ok"}), 200
+
+        if text == "reiniciar_menu":
+            conversaciones[phone]["estado"] = "menu"
+            conversaciones[phone]["msgs_mismo_estado"] = 0
+            send_message(phone, "Listo, empecemos de nuevo 🎮")
+            enviar_menu_principal(phone)
+            return jsonify({"status": "ok"}), 200
 
         historial = conversaciones[phone].get("historial", [])
         meses = conversaciones[phone].get("meses", "No especificado")
