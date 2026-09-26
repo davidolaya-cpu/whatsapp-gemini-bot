@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import hashlib
 import requests
 import smtplib
 import threading
@@ -15,32 +16,44 @@ from googleapiclient.discovery import build
 
 app = Flask(__name__)
 
-VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN")
-WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
-PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
+# ── Telegram ────────────────────────────────────────────────────────────────
+# Token que da @BotFather al crear el bot.
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TG_API = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN
+# Chat ID de Telegram del administrador. Para saberlo, escribele /miid al bot.
+ADMIN_PHONE = str(os.environ.get("ADMIN_CHAT_ID", "")).strip()
+# Contacto del asesor que se les muestra a los clientes (WhatsApp personal, @usuario...).
+ADMIN_PHONE_DISPLAY = os.environ.get("ADMIN_CONTACTO", "+57 322 908 2927")
+# Dominio publico del bot. Railway lo pone solo en RAILWAY_PUBLIC_DOMAIN.
+PUBLIC_DOMAIN = os.environ.get("PUBLIC_DOMAIN") or os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
+# Clave que Telegram manda en cada webhook para demostrar que viene de Telegram.
+# Si no se configura, se deriva del token (no hace falta crear otra variable).
+TELEGRAM_SECRET = os.environ.get("TELEGRAM_SECRET") or hashlib.sha256(
+    ("gamebot-" + TELEGRAM_BOT_TOKEN).encode("utf-8")).hexdigest()[:40]
+
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS")
 MP_ACCESS_TOKEN = os.environ.get("MP_ACCESS_TOKEN")
-MP_NOTIFICATION_URL = os.environ.get("MP_NOTIFICATION_URL")
+MP_NOTIFICATION_URL = os.environ.get("MP_NOTIFICATION_URL") or (
+    "https://" + PUBLIC_DOMAIN + "/mercadopago-webhook" if PUBLIC_DOMAIN else None)
 SHEET_ID = "1lvIlK1LYbT68HsuDTbMRzWSYh_RGUPHAZeV31_sAmdU"
-ADMIN_PHONE = "573229082927"
 HORA_SEGUIMIENTO = 3600
 HORA_RECORDATORIO_CONSOLA = 86400  # 24h para recordarle al cliente que avise cuando tenga consola
 
-# Alerta por correo cuando el token de WhatsApp deja de funcionar (no se puede
-# avisar por WhatsApp porque justo ese canal es el que fallo).
+# Alerta por correo cuando el token de Telegram deja de funcionar (no se puede
+# avisar por Telegram porque justo ese canal es el que fallo).
 EMAIL_ADDRESS = os.environ.get("EMAIL_ADDRESS")
 EMAIL_APP_PASSWORD = os.environ.get("EMAIL_APP_PASSWORD")
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", EMAIL_ADDRESS)
 ALERTA_TOKEN_COOLDOWN = 1800  # 30 min entre alertas para no saturar el correo
 _ultima_alerta_token = {"ts": 0}
 
-_flood_control = {}  # {phone: ultimo_timestamp_procesado}
+_flood_control = {}  # {chat_id: ultimo_timestamp_procesado}
 _sheets_errores_consecutivos = 0
 
-# Numeros bloqueados: el bot ignora todo lo que llegue de ellos y nunca les
+# Clientes bloqueados: el bot ignora todo lo que llegue de ellos y nunca les
 # envia mensajes. Se persiste en la hoja "Bloqueados" del Sheet.
-bloqueados = {}  # {phone: {"motivo": str, "fecha": str}}
+bloqueados = {}  # {chat_id: {"motivo": str, "fecha": str}}
 
 
 def enviar_alerta_email(asunto, cuerpo):
@@ -60,31 +73,17 @@ def enviar_alerta_email(asunto, cuerpo):
         print("Error enviando alerta por correo: " + str(e))
 
 
-def es_error_token(data):
-    # Detecta si una respuesta de la API de WhatsApp/Meta indica un token
-    # invalido, vencido o revocado (codigo 190 = OAuthException clasico).
-    if not isinstance(data, dict):
-        return False
-    error = data.get("error", {})
-    if not isinstance(error, dict):
-        return False
-    codigo = error.get("code")
-    tipo = str(error.get("type", ""))
-    mensaje = str(error.get("message", "")).lower()
-    return codigo == 190 or tipo == "OAuthException" or "access token" in mensaje
-
-
 def alertar_token_vencido(detalle):
     ahora = time.time()
     if ahora - _ultima_alerta_token["ts"] < ALERTA_TOKEN_COOLDOWN:
         return
     _ultima_alerta_token["ts"] = ahora
-    print("🚨 TOKEN DE WHATSAPP INVALIDO/VENCIDO: " + str(detalle))
+    print("🚨 TOKEN DE TELEGRAM INVALIDO: " + str(detalle))
     enviar_alerta_email(
-        "🚨 Game Line Col - El token de WhatsApp dejo de funcionar",
-        "El bot detecto que el token de acceso de WhatsApp (Meta) ya no es valido.\n\n"
-        "El bot NO puede enviar ni recibir mensajes de WhatsApp hasta que generes un token nuevo "
-        "(System User, sin expiracion) y lo actualices en la variable de entorno WHATSAPP_TOKEN en Railway.\n\n"
+        "🚨 Game Line Col - El token de Telegram dejo de funcionar",
+        "El bot detecto que el token de Telegram ya no es valido.\n\n"
+        "El bot NO puede enviar ni recibir mensajes hasta que pidas un token nuevo a @BotFather "
+        "(/mybots > tu bot > API Token) y lo actualices en la variable TELEGRAM_BOT_TOKEN en Railway.\n\n"
         "Detalle tecnico:\n" + str(detalle)
     )
 
@@ -268,19 +267,22 @@ def verificar_stock_bajo():
     return 30  # default
 
 
-_sheets_service = None
+_sheets_creds = None
 
 
 def get_sheets_service():
-    global _sheets_service
-    if _sheets_service is None:
+    # Se crea un servicio NUEVO en cada llamada. Antes se reutilizaba uno solo,
+    # y su conexion se "moria" tras horas sin uso (Errno 32 Broken pipe).
+    # Ademas, compartirlo entre el scheduler y el webhook no es seguro entre hilos.
+    # Las credenciales si se reutilizan, asi que esto es rapido.
+    global _sheets_creds
+    if _sheets_creds is None:
         creds_dict = json.loads(GOOGLE_CREDENTIALS)
-        creds = service_account.Credentials.from_service_account_info(
+        _sheets_creds = service_account.Credentials.from_service_account_info(
             creds_dict,
             scopes=["https://www.googleapis.com/auth/spreadsheets"]
         )
-        _sheets_service = build("sheets", "v4", credentials=creds)
-    return _sheets_service
+    return build("sheets", "v4", credentials=_sheets_creds, cache_discovery=False)
 
 
 def asegurar_hoja(titulo):
@@ -338,15 +340,34 @@ def cargar_config():
         print("Error cargando config: " + str(e))
 
 
+def normalizar_id(texto):
+    # Deja solo los digitos del chat ID de Telegram.
+    return re.sub(r"\D", "", str(texto or ""))
+
+
 def normalizar_numero(texto):
-    # Convierte "+57 322 908 2927", "322 908 2927" o "573229082927" al formato
-    # que usa WhatsApp internamente: 573229082927 (sin + ni espacios).
+    # Convierte "+57 322 908 2927", "322 908 2927" o "573229082927" a 573229082927.
+    # Se usa para reconocer a los clientes que venian de WhatsApp.
     digitos = re.sub(r"\D", "", str(texto or ""))
     if not digitos:
         return ""
     if len(digitos) == 10 and digitos.startswith("3"):
         digitos = "57" + digitos  # celular colombiano sin indicativo
     return digitos
+
+
+def cli(ph):
+    """Etiqueta legible de un cliente para los mensajes al admin."""
+    datos = conversaciones.get(str(ph), {})
+    partes = []
+    if datos.get("nombre"):
+        partes.append(datos["nombre"])
+    if datos.get("usuario"):
+        partes.append("@" + datos["usuario"])
+    if datos.get("telefono"):
+        partes.append("tel +" + datos["telefono"])
+    base = " ".join(partes) if partes else "Cliente"
+    return base + " (ID " + str(ph) + ")"
 
 
 def cargar_bloqueados():
@@ -360,7 +381,7 @@ def cargar_bloqueados():
         nuevos = {}
         for fila in filas[1:]:
             if fila and fila[0].strip():
-                telefono = normalizar_numero(fila[0])
+                telefono = normalizar_id(fila[0])
                 if not telefono:
                     continue
                 nuevos[telefono] = {
@@ -377,7 +398,7 @@ def guardar_bloqueados():
     try:
         service = get_sheets_service()
         asegurar_hoja("Bloqueados")
-        filas = [["Teléfono", "Motivo", "Fecha de bloqueo"]]
+        filas = [["Chat ID", "Motivo", "Fecha de bloqueo"]]
         for telefono, datos in bloqueados.items():
             filas.append([telefono, datos.get("motivo", ""), datos.get("fecha", "")])
         service.spreadsheets().values().clear(
@@ -396,17 +417,17 @@ def guardar_bloqueados():
 def esta_bloqueado(phone):
     if phone == ADMIN_PHONE:
         return False  # jamas bloqueamos al admin, seria quedarse sin control
-    return normalizar_numero(phone) in bloqueados
+    return normalizar_id(phone) in bloqueados
 
 
 def bloquear_numero(phone, motivo=""):
-    telefono = normalizar_numero(phone)
+    telefono = normalizar_id(phone)
     if not telefono:
-        return False, "Numero invalido."
-    if telefono == normalizar_numero(ADMIN_PHONE):
+        return False, "Chat ID invalido."
+    if telefono == normalizar_id(ADMIN_PHONE):
         return False, "No puedes bloquear el numero del administrador."
     if telefono in bloqueados:
-        return False, "El numero +" + telefono + " ya estaba bloqueado."
+        return False, "El cliente " + telefono + " ya estaba bloqueado."
 
     bloqueados[telefono] = {
         "motivo": motivo or "Sin motivo especificado",
@@ -435,32 +456,33 @@ def bloquear_numero(phone, motivo=""):
         detalles.append("renovacion cancelada")
 
     extra = (" (" + ", ".join(detalles) + ")") if detalles else ""
-    return True, "🚫 Numero +" + telefono + " bloqueado" + extra + "."
+    return True, "🚫 Cliente " + telefono + " bloqueado" + extra + "."
 
 
 def desbloquear_numero(phone):
-    telefono = normalizar_numero(phone)
+    telefono = normalizar_id(phone)
     if telefono not in bloqueados:
-        return False, "El numero +" + str(telefono) + " no estaba bloqueado."
+        return False, "El cliente " + str(telefono) + " no estaba bloqueado."
     del bloqueados[telefono]
     guardar_bloqueados()
-    return True, "✅ Numero +" + telefono + " desbloqueado. Ya puede escribirle al bot."
+    return True, "✅ Cliente " + telefono + " desbloqueado. Ya puede escribirle al bot."
 
 
 def guardar_renovaciones():
     try:
         service = get_sheets_service()
-        filas = [["telefono", "vencimiento", "tipo_cuenta", "meses", "notificado"]]
+        filas = [["cliente", "vencimiento", "tipo_cuenta", "meses", "notificado", "canal"]]
         for ph, datos in renovaciones.items():
             filas.append([
                 ph,
                 str(datos.get("vencimiento", 0)),
                 datos.get("tipo_cuenta", ""),
                 datos.get("meses", ""),
-                str(datos.get("notificado", False))
+                str(datos.get("notificado", False)),
+                datos.get("canal", "whatsapp")
             ])
         service.spreadsheets().values().clear(
-            spreadsheetId=SHEET_ID, range="Renovaciones!A:E"
+            spreadsheetId=SHEET_ID, range="Renovaciones!A:F"
         ).execute()
         service.spreadsheets().values().update(
             spreadsheetId=SHEET_ID,
@@ -476,7 +498,7 @@ def cargar_renovaciones():
     try:
         service = get_sheets_service()
         result = service.spreadsheets().values().get(
-            spreadsheetId=SHEET_ID, range="Renovaciones!A:E"
+            spreadsheetId=SHEET_ID, range="Renovaciones!A:F"
         ).execute()
         filas = result.get("values", [])
         cargadas = 0
@@ -486,7 +508,8 @@ def cargar_renovaciones():
                     "vencimiento": float(fila[1]),
                     "tipo_cuenta": fila[2],
                     "meses": fila[3],
-                    "notificado": fila[4] == "True"
+                    "notificado": fila[4] == "True",
+                    "canal": fila[5] if len(fila) > 5 and fila[5] else "whatsapp"
                 }
                 cargadas += 1
         print("Renovaciones cargadas: " + str(cargadas))
@@ -499,10 +522,10 @@ def registrar_compra(phone, tipo_cuenta, meses, email_cuenta=""):
     try:
         service = get_sheets_service()
         fecha = datetime.now().strftime("%d/%m/%Y %H:%M")
-        valores = [["+" + phone, fecha, tipo_cuenta, meses, email_cuenta]]
+        valores = [[str(phone), fecha, tipo_cuenta, meses, email_cuenta, cli(phone)]]
         service.spreadsheets().values().append(
             spreadsheetId=SHEET_ID,
-            range="Compras!A:E",
+            range="Compras!A:F",
             valueInputOption="RAW",
             body={"values": valores}
         ).execute()
@@ -513,7 +536,8 @@ def registrar_compra(phone, tipo_cuenta, meses, email_cuenta=""):
             "tipo_cuenta": tipo_cuenta,
             "meses": meses,
             "email_cuenta": email_cuenta,
-            "notificado": False
+            "notificado": False,
+            "canal": "telegram"
         }
         guardar_renovaciones()
     except Exception as e:
@@ -528,241 +552,108 @@ def registrar_compra(phone, tipo_cuenta, meses, email_cuenta=""):
                 pass
 
 
-def send_message(phone, message, intentos=3):
-    if esta_bloqueado(phone):
-        return False
-
-    url = "https://graph.facebook.com/v18.0/" + PHONE_NUMBER_ID + "/messages"
-    headers = {
-        "Authorization": "Bearer " + WHATSAPP_TOKEN,
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": phone,
-        "type": "text",
-        "text": {"body": message}
-    }
-    ultimo_resultado = None
+def _tg(metodo, payload, intentos=3):
+    """Llama a la API de Telegram con reintentos. Devuelve la respuesta o None."""
+    ultimo = None
+    payload = dict(payload)
     for intento in range(intentos):
         try:
-            r = requests.post(url, headers=headers, json=payload, timeout=10)
-            ultimo_resultado = r.json()
-            if r.status_code < 400:
-                return ultimo_resultado
-            print("WhatsApp error (intento " + str(intento + 1) + "): " + str(ultimo_resultado))
-            if es_error_token(ultimo_resultado):
-                alertar_token_vencido(ultimo_resultado)
+            r = requests.post(TG_API + "/" + metodo, json=payload, timeout=15)
+            ultimo = r.json()
+            if ultimo.get("ok"):
+                return ultimo
+            codigo = ultimo.get("error_code")
+            descripcion = str(ultimo.get("description", ""))
+            # Texto con * o _ sueltos (ej. una contraseña): se reenvia sin formato.
+            if codigo == 400 and "parse" in descripcion.lower() and payload.get("parse_mode"):
+                payload.pop("parse_mode", None)
+                continue
+            print("Telegram error en " + metodo + " (intento " + str(intento + 1) + "): " + descripcion)
+            if codigo == 401:
+                alertar_token_vencido(ultimo)
                 break
+            if codigo == 429:
+                time.sleep(int(ultimo.get("parameters", {}).get("retry_after", 2)))
+                continue
+            if codigo in (400, 403):
+                break  # chat inexistente o el usuario bloqueo al bot: no sirve reintentar
         except Exception as e:
-            print("Error enviando mensaje (intento " + str(intento + 1) + "): " + str(e))
+            print("Error llamando a Telegram " + metodo + " (intento " + str(intento + 1) + "): " + str(e))
         time.sleep(2)
-    return ultimo_resultado
+    return None
 
 
-def enviar_template(phone, nombre_plantilla, idioma="es_CO", parametros=None, intentos=3):
-    if esta_bloqueado(phone):
+def _destino_valido(phone):
+    if not phone:
+        print("⚠️ Mensaje sin destino (¿falta ADMIN_CHAT_ID en Railway?)")
         return False
+    return not esta_bloqueado(phone)
 
-    # A diferencia de send_message, esto SI funciona aunque hayan pasado mas de 24h
-    # desde el ultimo mensaje del cliente, porque usa una plantilla pre-aprobada por Meta.
-    # 'parametros' es una lista de textos para llenar las variables {{1}}, {{2}}... del
-    # cuerpo de la plantilla (opcional, solo si la plantilla las tiene).
-    # Primero hay que crear la plantilla en el WhatsApp Manager de Meta y esperar su aprobacion.
-    url = "https://graph.facebook.com/v18.0/" + PHONE_NUMBER_ID + "/messages"
-    headers = {
-        "Authorization": "Bearer " + WHATSAPP_TOKEN,
-        "Content-Type": "application/json"
-    }
-    template_payload = {"name": nombre_plantilla, "language": {"code": idioma}}
-    if parametros:
-        template_payload["components"] = [{
-            "type": "body",
-            "parameters": [{"type": "text", "text": p} for p in parametros]
-        }]
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": phone,
-        "type": "template",
-        "template": template_payload
-    }
-    ultimo_resultado = None
-    for intento in range(intentos):
-        try:
-            r = requests.post(url, headers=headers, json=payload, timeout=10)
-            ultimo_resultado = r.json()
-            if r.status_code < 400:
-                return ultimo_resultado
-            print("Error enviando plantilla (intento " + str(intento + 1) + "): " + str(ultimo_resultado))
-            if es_error_token(ultimo_resultado):
-                alertar_token_vencido(ultimo_resultado)
-                break
-        except Exception as e:
-            print("Error enviando plantilla (intento " + str(intento + 1) + "): " + str(e))
-        time.sleep(2)
-    return ultimo_resultado
+
+def send_message(phone, message, intentos=3, formato=True, reply_markup=None):
+    if not _destino_valido(phone):
+        return False
+    payload = {"chat_id": phone, "text": message, "disable_web_page_preview": True}
+    if formato:
+        payload["parse_mode"] = "Markdown"
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return _tg("sendMessage", payload, intentos)
 
 
 def reenviar_imagen(phone, media_id, caption="", intentos=2):
-    if esta_bloqueado(phone):
+    if not _destino_valido(phone):
         return False
-
-    url = "https://graph.facebook.com/v18.0/" + PHONE_NUMBER_ID + "/messages"
-    headers = {
-        "Authorization": "Bearer " + WHATSAPP_TOKEN,
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": phone,
-        "type": "image",
-        "image": {"id": media_id}
-    }
-    if caption:
-        payload["image"]["caption"] = caption
-    for intento in range(intentos):
-        try:
-            r = requests.post(url, headers=headers, json=payload, timeout=10)
-            data = r.json()
-            if r.status_code < 400:
-                return data
-            print("Error reenviando imagen (intento " + str(intento + 1) + "): " + str(data))
-            if es_error_token(data):
-                alertar_token_vencido(data)
-                break
-        except Exception as e:
-            print("Error reenviando imagen (intento " + str(intento + 1) + "): " + str(e))
-        time.sleep(2)
-    send_message(ADMIN_PHONE, "⚠️ No pude reenviarte la foto del comprobante (puede que el enlace ya haya expirado). Pidele al cliente que la reenvie si la necesitas.")
-    return None
+    r = _tg("sendPhoto", {"chat_id": phone, "photo": media_id, "caption": caption}, intentos)
+    if not r:
+        send_message(ADMIN_PHONE, "⚠️ No pude reenviarte una foto de comprobante. Pidele al cliente que la reenvie.")
+    return r
 
 
 def enviar_botones(phone, cuerpo, botones, intentos=3):
-    if esta_bloqueado(phone):
+    if not _destino_valido(phone):
         return False
-
-    url = "https://graph.facebook.com/v18.0/" + PHONE_NUMBER_ID + "/messages"
-    headers = {
-        "Authorization": "Bearer " + WHATSAPP_TOKEN,
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": phone,
-        "type": "interactive",
-        "interactive": {
-            "type": "button",
-            "body": {"text": cuerpo},
-            "action": {
-                "buttons": [
-                    {"type": "reply", "reply": {"id": b["id"], "title": b["titulo"]}} for b in botones
-                ]
-            }
-        }
-    }
-    for intento in range(intentos):
-        try:
-            r = requests.post(url, headers=headers, json=payload, timeout=10)
-            data = r.json()
-            if r.status_code < 400:
-                return data
-            print("Error enviando botones (intento " + str(intento + 1) + "): " + str(data))
-            if es_error_token(data):
-                alertar_token_vencido(data)
-                break
-        except Exception as e:
-            print("Error enviando botones (intento " + str(intento + 1) + "): " + str(e))
-        time.sleep(2)
-    return send_message(phone, cuerpo)  # respaldo: si fallan los botones, manda texto plano
+    teclado = {"inline_keyboard": [[{"text": b["titulo"], "callback_data": b["id"]}] for b in botones]}
+    r = send_message(phone, cuerpo, intentos, reply_markup=teclado)
+    return r or send_message(phone, cuerpo)  # respaldo: texto plano
 
 
 def enviar_lista(phone, cuerpo, texto_boton, filas, titulo_seccion="Opciones", intentos=3):
-    if esta_bloqueado(phone):
-        return False
-
-    url = "https://graph.facebook.com/v18.0/" + PHONE_NUMBER_ID + "/messages"
-    headers = {
-        "Authorization": "Bearer " + WHATSAPP_TOKEN,
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": phone,
-        "type": "interactive",
-        "interactive": {
-            "type": "list",
-            "body": {"text": cuerpo},
-            "action": {
-                "button": texto_boton,
-                "sections": [{
-                    "title": titulo_seccion,
-                    "rows": [{"id": f["id"], "title": f["titulo"], "description": f.get("descripcion", "")} for f in filas]
-                }]
-            }
-        }
-    }
-    for intento in range(intentos):
-        try:
-            r = requests.post(url, headers=headers, json=payload, timeout=10)
-            data = r.json()
-            if r.status_code < 400:
-                return data
-            print("Error enviando lista (intento " + str(intento + 1) + "): " + str(data))
-            if es_error_token(data):
-                alertar_token_vencido(data)
-                break
-        except Exception as e:
-            print("Error enviando lista (intento " + str(intento + 1) + "): " + str(e))
-        time.sleep(2)
-    return send_message(phone, cuerpo)  # respaldo: si falla la lista, manda texto plano
+    # En Telegram la "lista" se muestra como botones, uno por renglon.
+    botones = []
+    for f in filas:
+        titulo = f["titulo"] + ((" · " + f["descripcion"]) if f.get("descripcion") else "")
+        botones.append({"id": f["id"], "titulo": titulo})
+    return enviar_botones(phone, cuerpo, botones, intentos)
 
 
 def enviar_documento(phone, media_id, caption="", nombre_archivo="Catalogo_Game_Line_Col.pdf", intentos=3):
-    if esta_bloqueado(phone):
+    if not _destino_valido(phone):
         return False
+    r = _tg("sendDocument", {"chat_id": phone, "document": media_id, "caption": caption}, intentos)
+    if not r:
+        send_message(phone, caption)
+    return r
 
-    url = "https://graph.facebook.com/v18.0/" + PHONE_NUMBER_ID + "/messages"
-    headers = {
-        "Authorization": "Bearer " + WHATSAPP_TOKEN,
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": phone,
-        "type": "document",
-        "document": {
-            "id": media_id,
-            "caption": caption,
-            "filename": nombre_archivo
+
+def pedir_telefono(phone):
+    """Boton de Telegram para que el cliente comparta su numero (opcional).
+    Sirve para reconocer a quienes ya eran clientes por WhatsApp."""
+    send_message(phone,
+        "📱 Si ya eras cliente nuestro por WhatsApp, toca el boton de abajo para compartir tu numero "
+        "y reconocer tu plan. Es opcional.",
+        reply_markup={
+            "keyboard": [[{"text": "📱 Compartir mi numero", "request_contact": True}]],
+            "resize_keyboard": True,
+            "one_time_keyboard": True
         }
-    }
-    for intento in range(intentos):
-        try:
-            r = requests.post(url, headers=headers, json=payload, timeout=10)
-            data = r.json()
-            if r.status_code < 400:
-                return data
-            print("Error enviando documento (intento " + str(intento + 1) + "): " + str(data))
-            if es_error_token(data):
-                alertar_token_vencido(data)
-                break
-        except Exception as e:
-            print("Error enviando documento (intento " + str(intento + 1) + "): " + str(e))
-        time.sleep(2)
-    send_message(phone, caption)
-    return None
+    )
 
 
-def descargar_media(media_id):
-    url = "https://graph.facebook.com/v18.0/" + media_id
-    headers = {"Authorization": "Bearer " + WHATSAPP_TOKEN}
-    info = requests.get(url, headers=headers, timeout=10).json()
-    if es_error_token(info):
-        alertar_token_vencido(info)
-    media_url = info.get("url")
-    mime_type = info.get("mime_type", "image/jpeg")
-    media_resp = requests.get(media_url, headers=headers)
-    return media_resp.content, mime_type
+def responder_callback(callback_id):
+    # Quita el "cargando..." del boton que toco el cliente.
+    if callback_id:
+        _tg("answerCallbackQuery", {"callback_query_id": callback_id}, intentos=1)
 
 
 PRECIOS_GAMEPASS = {
@@ -776,7 +667,9 @@ PRECIOS_GAMEPASS = {
 
 def crear_link_pago(phone, concepto, monto):
     try:
-        referencia = phone + "-" + str(int(time.time()))
+        referencia = str(phone) + "-" + str(int(time.time()))
+        if phone in conversaciones:
+            conversaciones[phone]["pago_mp_confirmado"] = False  # link nuevo = pago nuevo
         url = "https://api.mercadopago.com/checkout/preferences"
         headers = {
             "Authorization": "Bearer " + MP_ACCESS_TOKEN,
@@ -813,27 +706,77 @@ def mensaje_opciones_pago(link):
     if link:
         texto += "💳 Tarjeta, PSE o Nequi por Mercado Pago (confirmacion automatica):\n" + link + "\n\n"
     texto += ("📲 Nequi: 3057059517\n📲 Daviplata: 3057059517\n🏦 Llave: 3057059517 (David Olaya)\n\n"
-              "Si pagas directo por Nequi/Daviplata/Llave, envianos la foto del comprobante aqui 📸. "
-              "Si usas el link de Mercado Pago, lo confirmamos automaticamente.")
+              "📸 IMPORTANTE: si pagas por Nequi, Daviplata o Llave, envia *aqui mismo* "
+              "la foto del comprobante para continuar 👍\n\n"
+              "Si usas el link de Mercado Pago, lo confirmamos automaticamente y no necesitas enviar nada.")
     return texto
 
 
-def leer_comprobante(media_bytes, mime_type):
-    try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash-lite",
-            contents=[
-                types.Part.from_bytes(data=media_bytes, mime_type=mime_type),
-                "Esta imagen es un comprobante de pago colombiano (Nequi, Daviplata o transferencia/llave "
-                "bancaria). Extrae y resume en espanol, en pocas lineas: monto pagado, fecha y hora si aparecen, "
-                "y el numero, cuenta o llave destino si aparece. Si la imagen no parece un comprobante de pago "
-                "o no logras leer algun dato, dilo claramente."
-            ]
+# Mensaje corto reutilizable para recordarle al cliente a donde va el comprobante.
+RECORDAR_COMPROBANTE_ADMIN = (
+    "📸 Cuando hayas pagado, envia *aqui mismo* la foto del comprobante para continuar 👍\n\n"
+    "Si necesitas otra cosa, escribe *menu*. Si quieres hablar con una persona, escribe *asesor*."
+)
+
+# Frases con las que el cliente nos avisa que ya pago y ya mando el comprobante.
+CONFIRMACIONES_PAGO = (
+    "listo", "listo!", "ya", "ya envie", "ya envié", "ya lo envie", "ya lo envié",
+    "ya te envie", "ya te envié", "ya lo mande", "ya lo mandé", "ya mande", "ya mandé",
+    "enviado", "ya pague", "ya pagué", "ya lo pague", "ya lo pagué", "pagado",
+    "ya esta", "ya está", "hecho", "ok listo"
+)
+
+
+def avanzar_tras_pago(phone, estado):
+    """El cliente avisa que ya pago y que ya envio el comprobante al asesor.
+    El bot avanza el flujo solo (ya no se espera el comando pagook/reservaok).
+    Devuelve True si efectivamente avanzo el estado."""
+
+    # ── Reserva pagada: pasa a esperar que tenga la consola disponible ────────
+    if estado in ("esperando_comprobante", "comprobante_reserva_enviado"):
+        conversaciones[phone]["estado"] = "esperando_consola"
+        conversaciones[phone]["reserva_pagada"] = True
+        conversaciones[phone]["compro"] = True
+        conversaciones[phone]["recordatorio_consola_at"] = time.time() + HORA_RECORDATORIO_CONSOLA
+        registrar_evento_diario("reservas")
+        enviar_boton_consola_lista(phone,
+            "✅ Perfecto, gracias!\n\n"
+            "Cuando tengas tu consola o PC disponible, avisanos aqui para entregarte tu cuenta al instante 🎮"
         )
-        return response.text.strip()
-    except Exception as e:
-        print("Error leyendo comprobante: " + str(e))
-        return "No pude leer el comprobante automaticamente, revisa la imagen manualmente."
+        send_message(ADMIN_PHONE,
+            "💰 RESERVA - El cliente " + cli(phone) + " avisa que ya pago.\n\n"
+            "Plan: " + str(conversaciones[phone].get("meses")) + "\n\n"
+            "⚠️ Verifica el pago (te reenvie la foto si la mando). El bot ya lo dejo esperando consola.\n"
+            "Si el pago NO llego: *anular " + phone[-4:] + "*"
+        )
+        return True
+
+    # ── Pago final o renovacion: se cierra la venta ───────────────────────────
+    if estado in ("esperando_pago_final", "pago_final_enviado",
+                  "renovacion_espera_pago", "renovacion_comprobante_enviado"):
+        tipo_cuenta_c = conversaciones[phone].get("tipo_cuenta", "No especificado")
+        meses_c = conversaciones[phone].get("meses", "No especificado")
+        email_c = conversaciones[phone].get("email_cuenta", "")
+        es_renovacion = conversaciones[phone].get("es_renovacion", False)
+
+        conversaciones[phone]["estado"] = "pago_confirmado"
+        conversaciones[phone]["compro"] = True
+        send_message(phone, CIERRE)
+        registrar_compra(phone, tipo_cuenta_c, meses_c, email_c)
+        registrar_evento_diario("cierres")
+        if es_renovacion and phone in renovaciones:
+            renovaciones[phone]["notificado"] = False
+
+        etiqueta = "RENOVACION" if es_renovacion else "PAGO FINAL"
+        send_message(ADMIN_PHONE,
+            "💰 " + etiqueta + " - El cliente " + cli(phone) + " avisa que ya pago.\n\n"
+            "Plan: " + str(meses_c) + " - " + str(tipo_cuenta_c) + "\n\n"
+            "⚠️ Verifica el pago (te reenvie la foto si la mando). El bot ya registro la compra y cerro la venta.\n"
+            "Si el pago NO llego: *anular " + phone[-4:] + "*"
+        )
+        return True
+
+    return False
 
 
 PALABRAS_COMUNES = ["gracias", "listo", "vale", "ok", "okay", "perfecto", "genial", "bueno",
@@ -857,8 +800,10 @@ def extraer_meses(texto):
         "12": "12 meses", "doce": "12 meses",
         "un ano": "12 meses", "un año": "12 meses"
     }
+    if texto in meses_map:
+        return meses_map[texto]
     for key, value in meses_map.items():
-        if texto == key or key in texto:
+        if re.search(r"\b" + re.escape(key) + r"\b", texto):
             return value
     return None
 
@@ -869,7 +814,7 @@ def es_agradecimiento(texto):
     return any(p in texto for p in palabras)
 
 
-ESTADOS_RANGE = "Estados!A:B"
+ESTADOS_RANGE = "Estados_TG!A:B"  # hoja aparte: no se mezcla con los chats de WhatsApp
 
 
 
@@ -953,7 +898,7 @@ def scheduler():
                         "3️⃣ Copia el nuevo codigo que aparece y envialo aqui 📲"
                     )
                     send_message(ADMIN_PHONE,
-                        "⏰ CODIGO VENCIDO - Game Line Col\nCliente: +" + phone +
+                        "⏰ CODIGO VENCIDO - Game Line Col\nCliente: " + cli(phone) +
                         "\nMeses: " + meses + "\nCuenta: " + tipo_cuenta +
                         "\nCodigo anterior: " + codigo +
                         "\nEl cliente va a generar un nuevo codigo, espera el nuevo."
@@ -966,7 +911,7 @@ def scheduler():
             if estado == "esperando_pago_final" and not datos.get("alerta_inactividad_enviada"):
                 if (ahora - ultima) >= 86400:
                     send_message(ADMIN_PHONE,
-                        "⚠️ Cliente +" + phone + " lleva mas de 24h sin enviar "
+                        "⚠️ Cliente " + cli(phone) + " lleva mas de 24h sin enviar "
                         "el comprobante del pago final. Quizas valga la pena escribirle."
                     )
                     conversaciones[phone]["alerta_inactividad_enviada"] = True
@@ -988,6 +933,8 @@ def scheduler():
         for phone_rv, datos_rv in list(renovaciones.items()):
             if datos_rv.get("notificado"):
                 continue
+            if datos_rv.get("canal") != "telegram":
+                continue  # cliente de WhatsApp que aun no vincula su numero
             if ahora >= datos_rv.get("vencimiento", 0):
                 tipo_rv = datos_rv.get("tipo_cuenta", "")
                 meses_rv = datos_rv.get("meses", "")
@@ -1031,7 +978,7 @@ def scheduler():
                 send_message(phone,
                     "⏰ Recordatorio Game Line Col\n\n"
                     "Tu renovacion de Game Pass" + (" " + meses_rv if meses_rv else "") + " sigue pendiente de pago.\n\n"
-                    "Cuando hayas pagado envianos la foto del comprobante aqui 📸"
+                    "Cuando hayas pagado envia aqui mismo la foto del comprobante 📸"
                 )
                 conversaciones[phone]["renovacion_recordatorio_enviado"] = True
 
@@ -1050,7 +997,7 @@ def scheduler():
                 ).execute()
                 service.spreadsheets().values().update(
                     spreadsheetId=SHEET_ID,
-                    range="Estados!A1",
+                    range="Estados_TG!A1",
                     valueInputOption="RAW",
                     body={"values": filas}
                 ).execute()
@@ -1077,7 +1024,7 @@ def scheduler():
 
 
 conversaciones = {}
-asegurar_hoja("Estados")
+asegurar_hoja("Estados_TG")
 asegurar_hoja("Config")
 asegurar_hoja("Compras")
 asegurar_hoja("Renovaciones")
@@ -1094,7 +1041,7 @@ def inicializar_hojas():
             service.spreadsheets().values().update(
                 spreadsheetId=SHEET_ID, range="Compras!A1",
                 valueInputOption="RAW",
-                body={"values": [["Teléfono", "Fecha de compra", "Tipo de cuenta", "Tiempo adquirido", "Email cuenta"]]}
+                body={"values": [["Cliente (ID)", "Fecha de compra", "Tipo de cuenta", "Tiempo adquirido", "Email cuenta", "Nombre / usuario"]]}
             ).execute()
         # Encabezados Cuentas
         r2 = service.spreadsheets().values().get(spreadsheetId=SHEET_ID, range="Cuentas!A1:F1").execute()
@@ -1109,17 +1056,35 @@ def inicializar_hojas():
         print("Error inicializando hojas: " + str(e))
 
 
-def verificar_token_whatsapp():
+def verificar_token_telegram():
     try:
-        url = "https://graph.facebook.com/v18.0/" + str(PHONE_NUMBER_ID)
-        r = requests.get(url, headers={"Authorization": "Bearer " + str(WHATSAPP_TOKEN)}, timeout=10)
-        data = r.json()
-        if es_error_token(data):
-            alertar_token_vencido(data)
+        r = requests.get(TG_API + "/getMe", timeout=10).json()
+        if r.get("ok"):
+            print("✅ Token de Telegram correcto. Bot: @" + str(r["result"].get("username")))
         else:
-            print("✅ Token de WhatsApp verificado correctamente al iniciar.")
+            alertar_token_vencido(r)
     except Exception as e:
-        print("No se pudo verificar el token de WhatsApp al iniciar: " + str(e))
+        print("No se pudo verificar el token de Telegram al iniciar: " + str(e))
+
+
+def configurar_webhook():
+    # Le dice a Telegram a que URL mandar los mensajes. Se hace solo en cada arranque.
+    if not PUBLIC_DOMAIN:
+        print("⚠️ No hay dominio publico: genera uno en Railway (Settings > Networking > Generate Domain).")
+        return
+    url = "https://" + PUBLIC_DOMAIN + "/telegram-webhook"
+    try:
+        r = requests.post(TG_API + "/setWebhook", json={
+            "url": url,
+            "secret_token": TELEGRAM_SECRET,
+            "allowed_updates": ["message", "callback_query"]
+        }, timeout=10).json()
+        if r.get("ok"):
+            print("🔗 Webhook de Telegram configurado en " + url)
+        else:
+            print("Error configurando webhook: " + str(r))
+    except Exception as e:
+        print("Error configurando webhook: " + str(e))
 
 
 cargar_bloqueados()
@@ -1128,10 +1093,18 @@ cargar_config()
 cargar_renovaciones()
 cargar_cuentas()
 inicializar_hojas()
-verificar_token_whatsapp()
+verificar_token_telegram()
+configurar_webhook()
+if not ADMIN_PHONE:
+    print("⚠️ Falta ADMIN_CHAT_ID: escribele /miid al bot y pon ese numero en Railway.")
+
 threading.Thread(target=scheduler, daemon=True).start()
 
-BIENVENIDA = "🎮 Bienvenido a Game Line Col! 🎮\n\nSomos tu tienda de confianza para juegos y suscripciones Xbox.\n\nEn que te podemos ayudar? 👇"
+BIENVENIDA = ("🎮 Bienvenido a Game Line Col! 🎮\n\n"
+              "Somos tu tienda de confianza para juegos y suscripciones Xbox.\n\n"
+              "💡 En cualquier momento puedes escribir *menu* para volver al inicio, "
+              "o *asesor* si necesitas hablar con una persona.\n\n"
+              "En que te podemos ayudar? 👇")
 
 GAMEPASS = "🕹️ GAME PASS ULTIMATE\n\nPRECIOS:\n📅 1 mes: $29.900\n📅 2 meses: $55.000\n📅 3 meses: $80.000\n📅 6 meses: $140.000\n📅 12 meses: $190.000\n\nMODALIDADES:\n🏠 Principal: juegas desde tu cuenta sin iniciar sesion en otra\n👤 Secundaria: juegas desde tu cuenta iniciando sesion en la del servicio\n\nAmbas funcionan perfecto, solo cambia la configuracion.\n\nGARANTIA: Primero pruebas y luego pagas."
 
@@ -1145,7 +1118,7 @@ CONFIG_SECUNDARIA = "Una vez habilitemos tu cuenta, sigue estos pasos en tu cons
 
 ACTIVACION = "Sigue estos pasos en tu consola o PC:\n\n1 Ve a Agregar nuevo (como nueva cuenta)\n2 Selecciona Usar otro dispositivo\n3 Copia el codigo que aparece y envialo aqui\n\nNuestro asesor lo activara de inmediato! 🚀"
 
-SOPORTE = "SOPORTE\n\nUn asesor te atendera personalmente.\n\nEscribenos al: +57 322 908 2927 😊"
+SOPORTE = "SOPORTE\n\nUn asesor te atendera personalmente.\n\nEscribenos a: " + ADMIN_PHONE_DISPLAY + " 😊"
 
 CIERRE = "🎮 Con mucho gusto! Gracias a ti por confiar en Game Line Col 🙌\n\nCualquier cosa que necesites aqui estamos. Que disfrutes tu juego! 🚀"
 
@@ -1160,11 +1133,11 @@ ESTADO_CLIENTE_MENSAJE = {
     "seleccion_cuenta": "Estamos esperando que elijas el tipo de cuenta (Principal o Secundaria).",
     "preguntar_consola": "Estamos esperando que nos digas si tienes tu consola o PC disponible ahora.",
     "activacion": "Estamos esperando el codigo de activacion de tu consola. Envialo aqui cuando lo tengas 🎮",
-    "esperando_comprobante": "Estamos esperando el comprobante de pago de tu reserva 📸",
-    "comprobante_reserva_enviado": "Recibimos el comprobante de tu reserva, un asesor lo esta confirmando ⏳",
+    "esperando_comprobante": "Estamos esperando que pagues tu reserva y nos envies aqui la foto del comprobante 📸",
+    "comprobante_reserva_enviado": "Envianos aqui la foto del comprobante de tu reserva ⏳",
     "esperando_consola": "Tu reserva esta confirmada ✅. Avisanos aqui cuando tengas tu consola o PC disponible para entregarte tu cuenta 🎮",
-    "esperando_pago_final": "Tu cuenta ya esta activada 🎮. Estamos esperando el comprobante del pago final 📸",
-    "pago_final_enviado": "Recibimos tu comprobante de pago final, un asesor lo esta confirmando ⏳",
+    "esperando_pago_final": "Tu cuenta ya esta activada 🎮. Envianos aqui la foto del comprobante del pago final 📸",
+    "pago_final_enviado": "Envianos aqui la foto del comprobante de tu pago final ⏳",
     "pago_confirmado": "Tu pedido esta cerrado y confirmado. Gracias por tu compra! 🎮🙌",
     "juegos": "Estamos esperando que nos digas el nombre del juego que buscas.",
     "soporte": "Tu solicitud de soporte fue enviada, un asesor te contactara pronto 😊",
@@ -1173,6 +1146,7 @@ ESTADO_CLIENTE_MENSAJE = {
     "sop_online_p1": "Revisando Xbox Principal. Dinos el estado de la casilla.",
     "sop_online_p2": "Aplicando solucion paso 1. Prueba el online y cuentanos como te fue.",
     "sop_online_p3": "Aplicando solucion de facturacion. Prueba el online y cuentanos como te fue.",
+    "sop_online_p4": "Aplicando el reinicio completo de configuracion de tu consola. Sigue los 6 pasos y cuentanos como te fue.",
     "sop_online_s1": "Aplicando solucion de facturacion para cuenta Secundaria. Prueba y cuentanos.",
     "sop_jugando": "Diagnosticando problema de otro usuario jugando. Elige el tipo de cuenta.",
     "sop_jugando_p1": "Aplicando solucion para cuenta Principal. Prueba y cuentanos como te fue.",
@@ -1181,8 +1155,8 @@ ESTADO_CLIENTE_MENSAJE = {
     "renovacion_pendiente": "Te preguntamos si quieres renovar tu servicio. Usa los botones para responder.",
     "renovacion_espera_admin": "Tu solicitud de renovacion fue enviada al asesor, en breve te respondemos 🙏",
     "renovacion_espera_tiempo": "Dinos en cuanto tiempo puedes hacer el pago (ej: 30 minutos, 1 hora).",
-    "renovacion_espera_pago": "Estamos esperando tu comprobante de pago para la renovacion 📸",
-    "renovacion_comprobante_enviado": "Recibimos tu comprobante de renovacion, un asesor lo esta confirmando ⏳"
+    "renovacion_espera_pago": "Envianos aqui la foto del comprobante de tu renovacion 📸",
+    "renovacion_comprobante_enviado": "Envianos aqui la foto del comprobante de tu renovacion ⏳"
 }
 
 
@@ -1224,50 +1198,153 @@ def enviar_pregunta_consola(phone, prefijo=""):
     ])
 
 
+def nueva_conversacion():
+    return {
+        "estado": "menu",
+        "historial": [],
+        "ultima_interaccion": time.time(),
+        "recordatorio_enviado": False,
+        "compro": False,
+        "meses": None,
+        "tipo_cuenta": None,
+        "bienvenida_enviada": False,
+        "ultimo_msg_id": ""
+    }
+
+
+def vincular_telefono(chat_id, contacto, usuario_tg):
+    """El cliente compartio su numero. Si ya era cliente por WhatsApp, su
+    renovacion y su cuenta asignada pasan a este chat de Telegram."""
+    quitar = {"remove_keyboard": True}
+    if contacto.get("user_id") and str(contacto.get("user_id")) != str(usuario_tg.get("id")):
+        send_message(chat_id, "Por seguridad, comparte *tu propio* numero con el boton 📱", reply_markup=quitar)
+        return
+    telefono = normalizar_numero(contacto.get("phone_number", ""))
+    if not telefono:
+        return
+    datos = conversaciones.setdefault(chat_id, nueva_conversacion())
+    datos["telefono"] = telefono
+    datos["nombre"] = (str(usuario_tg.get("first_name", "")) + " " + str(usuario_tg.get("last_name", ""))).strip()
+    datos["usuario"] = usuario_tg.get("username", "")
+
+    encontrado = []
+    if telefono in renovaciones and chat_id not in renovaciones:
+        renovaciones[chat_id] = renovaciones.pop(telefono)
+        renovaciones[chat_id]["canal"] = "telegram"
+        guardar_renovaciones()
+        rv = renovaciones[chat_id]
+        encontrado.append("tu plan de Game Pass (" + str(rv.get("tipo_cuenta", "")) + " - " + str(rv.get("meses", "")) + ")")
+    for c in cuentas:
+        cambio = False
+        if str(c.get("cliente_principal", "")).strip() == telefono:
+            c["cliente_principal"] = chat_id
+            cambio = True
+        if str(c.get("cliente_secundaria", "")).strip() == telefono:
+            c["cliente_secundaria"] = chat_id
+            cambio = True
+        if cambio:
+            actualizar_fila_cuenta(c["fila"], c)
+            if not encontrado:
+                encontrado.append("tu cuenta asignada")
+
+    if encontrado:
+        send_message(chat_id,
+            "✅ Te reconocimos! Encontramos " + " y ".join(encontrado) + ".\n\n"
+            "Desde ahora te avisaremos por aqui cuando tu servicio vaya a vencer 🎮",
+            reply_markup=quitar)
+        send_message(ADMIN_PHONE, "🔗 Cliente de WhatsApp vinculado a Telegram: " + cli(chat_id))
+    else:
+        send_message(chat_id, "✅ Gracias! Guardamos tu numero.", reply_markup=quitar)
+    if not datos.get("bienvenida_enviada"):
+        datos["bienvenida_enviada"] = True
+        send_message(chat_id, BIENVENIDA)
+        enviar_menu_principal(chat_id)
+
+
 def enviar_boton_consola_lista(phone, mensaje):
     enviar_botones(phone, mensaje, [
         {"id": "consola_lista", "titulo": "🎮 Ya tengo mi consola"}
     ])
 
 
-@app.route("/webhook", methods=["GET"])
-def verify():
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
-    if token == VERIFY_TOKEN:
-        return challenge, 200
-    return "Token invalido", 403
+@app.route("/", methods=["GET"])
+def salud():
+    return "GameBot Telegram activo", 200
 
 
-@app.route("/webhook", methods=["POST"])
+@app.route("/telegram-webhook", methods=["POST"])
 def webhook():
-    data = request.json
+    # Telegram manda en cada peticion la clave secreta que registramos al arrancar.
+    if request.headers.get("X-Telegram-Bot-Api-Secret-Token", "") != TELEGRAM_SECRET:
+        print("🛑 Webhook RECHAZADO: clave secreta invalida. IP: " +
+              str(request.headers.get("X-Forwarded-For", request.remote_addr)))
+        return jsonify({"status": "forbidden"}), 403
+
+    update = request.get_json(silent=True) or {}
     try:
-        value = data["entry"][0]["changes"][0]["value"]
-        if "messages" not in value:
-            return jsonify({"status": "ok"}), 200
-        message = value["messages"][0]
-        msg_type = message.get("type")
-        if msg_type not in ("text", "image", "interactive", "document"):
+        msg_id = str(update.get("update_id", ""))
+        text = ""
+        foto_id = None
+        if "callback_query" in update:  # el cliente toco un boton
+            cq = update["callback_query"]
+            responder_callback(cq.get("id"))
+            message = cq.get("message") or {}
+            usuario_tg = cq.get("from", {})
+            text = str(cq.get("data", ""))
+            msg_type = "interactive"
+        elif "message" in update:
+            message = update["message"]
+            usuario_tg = message.get("from", {})
+            if "text" in message:
+                msg_type = "text"
+                text = message["text"].strip()
+            elif "photo" in message:
+                msg_type = "image"
+                foto_id = message["photo"][-1]["file_id"]  # la de mayor resolucion
+            elif "document" in message:
+                msg_type = "document"
+            elif "contact" in message:
+                msg_type = "contact"
+            else:
+                return jsonify({"status": "ok"}), 200
+        else:
             return jsonify({"status": "ok"}), 200
 
-        phone = message["from"]
-        msg_id = message.get("id", "")
+        chat = message.get("chat", {})
+        if chat.get("type") != "private":
+            return jsonify({"status": "ok"}), 200  # solo se atienden chats privados
+        phone = str(chat.get("id"))
+        print("📩 Mensaje de " + phone + " (tipo: " + msg_type + ")")
 
-        # ── Numeros bloqueados: se descarta el mensaje sin responder nada ─────
-        # Devolvemos 200 igual para que Meta no reintente el envio.
+        # Comandos de Telegram: "/start", "/menu@MiBot", "/bloquear 1234 motivo"...
+        if msg_type == "text" and text.startswith("/"):
+            partes_cmd = text[1:].split(" ", 1)
+            text = partes_cmd[0].split("@")[0] + ((" " + partes_cmd[1]) if len(partes_cmd) > 1 else "")
+            if text.lower().startswith("start"):
+                text = "hola"
+
+        if text.lower().strip() == "miid":
+            send_message(phone, "Tu chat ID es: " + phone, formato=False)
+            return jsonify({"status": "ok"}), 200
+
+        # ── Clientes bloqueados: se descarta el mensaje sin responder nada ────
         if esta_bloqueado(phone):
-            print("🚫 Mensaje ignorado de numero bloqueado: +" + phone)
+            print("🚫 Mensaje ignorado de cliente bloqueado: " + phone)
             return jsonify({"status": "ok"}), 200
 
-        # ── Anti-flood: máximo 1 mensaje procesado cada 2 segundos por cliente ─
+        # Nombre y usuario de Telegram, para que el admin sepa quien es quien.
+        if phone in conversaciones:
+            conversaciones[phone]["nombre"] = (str(usuario_tg.get("first_name", "")) + " " +
+                                               str(usuario_tg.get("last_name", ""))).strip()
+            conversaciones[phone]["usuario"] = usuario_tg.get("username", "")
+
+        # ── Anti-flood: máximo 1 mensaje procesado por segundo por cliente ────
         if phone != ADMIN_PHONE:
             ahora_flood = time.time()
             ultimo_flood = _flood_control.get(phone, 0)
-            if (ahora_flood - ultimo_flood) < 2:
+            if (ahora_flood - ultimo_flood) < 1:
                 return jsonify({"status": "ok"}), 200
             _flood_control[phone] = ahora_flood
-            # Limpiar entradas viejas cada 100 mensajes para no acumular
             if len(_flood_control) > 100:
                 hace_5min = ahora_flood - 300
                 for p in [k for k, v in _flood_control.items() if v < hace_5min]:
@@ -1275,10 +1352,10 @@ def webhook():
 
         # ── Comando setcatalogo: admin envía el PDF con caption "setcatalogo" ─
         if msg_type == "document" and phone == ADMIN_PHONE:
-            caption_doc = message.get("document", {}).get("caption", "").lower().strip()
+            caption_doc = str(message.get("caption", "")).lower().strip()
             if "setcatalogo" in caption_doc:
                 global catalogo_media_id
-                catalogo_media_id = message["document"]["id"]
+                catalogo_media_id = message["document"]["file_id"]
                 guardar_config("catalogo_media_id", catalogo_media_id)
                 send_message(ADMIN_PHONE, "✅ Catalogo actualizado correctamente! Ahora se enviara automaticamente a los clientes que pregunten por juegos 🎮")
             else:
@@ -1288,18 +1365,10 @@ def webhook():
         if msg_type == "document":
             return jsonify({"status": "ok"}), 200
 
-        if msg_type == "text":
-            text = message["text"]["body"].strip()
-        elif msg_type == "interactive":
-            interactive_data = message.get("interactive", {})
-            if interactive_data.get("type") == "button_reply":
-                text = interactive_data["button_reply"]["id"]
-            elif interactive_data.get("type") == "list_reply":
-                text = interactive_data["list_reply"]["id"]
-            else:
-                text = ""
-        else:
-            text = ""
+        if msg_type == "contact":
+            vincular_telefono(phone, message.get("contact", {}), usuario_tg)
+            return jsonify({"status": "ok"}), 200
+
         text_lower = text.lower()
 
         if phone == ADMIN_PHONE and text_lower.startswith("activo"):
@@ -1344,7 +1413,7 @@ def webhook():
                 conversaciones[cliente_encontrado]["codigo_pendiente"] = None
                 conversaciones[cliente_encontrado]["codigo_pendiente_at"] = None
                 conversaciones[cliente_encontrado]["codigo_recordatorio_enviado"] = True
-                send_message(ADMIN_PHONE, "✅ Configuracion " + tipo_cuenta_elegida + " y opciones de pago enviadas al cliente +" + cliente_encontrado)
+                send_message(ADMIN_PHONE, "✅ Configuracion " + tipo_cuenta_elegida + " y opciones de pago enviadas al cliente " + cli(cliente_encontrado))
             else:
                 send_message(ADMIN_PHONE, "No encontre un cliente pendiente con esos ultimos 4 digitos: " + ultimos_4)
             return jsonify({"status": "ok"}), 200
@@ -1366,8 +1435,9 @@ def webhook():
                 email_c = conversaciones[cliente_encontrado].get("email_cuenta", "")
                 es_renovacion = conversaciones[cliente_encontrado].get("es_renovacion", False)
                 conversaciones[cliente_encontrado]["estado"] = "pago_confirmado"
+                conversaciones[cliente_encontrado]["compro"] = True
                 send_message(cliente_encontrado, CIERRE)
-                send_message(ADMIN_PHONE, "✅ Pago confirmado, cierre enviado al cliente +" + cliente_encontrado)
+                send_message(ADMIN_PHONE, "✅ Pago confirmado, cierre enviado al cliente " + cli(cliente_encontrado))
                 registrar_compra(cliente_encontrado, tipo_cuenta_c, meses_c, email_c)
                 registrar_evento_diario("cierres")
                 if es_renovacion:
@@ -1387,13 +1457,14 @@ def webhook():
             if cliente_encontrado:
                 conversaciones[cliente_encontrado]["estado"] = "esperando_consola"
                 conversaciones[cliente_encontrado]["reserva_pagada"] = True
+                conversaciones[cliente_encontrado]["compro"] = True
                 conversaciones[cliente_encontrado]["recordatorio_consola_at"] = time.time() + HORA_RECORDATORIO_CONSOLA
                 registrar_evento_diario("reservas")
                 enviar_boton_consola_lista(cliente_encontrado,
                     "✅ Tu reserva quedo confirmada!\n\n"
                     "Cuando tengas tu consola o PC disponible, avisanos aqui para entregarte tu cuenta al instante 🎮"
                 )
-                send_message(ADMIN_PHONE, "✅ Reserva confirmada para +" + cliente_encontrado + ". Quedara esperando a que avise cuando tenga consola.")
+                send_message(ADMIN_PHONE, "✅ Reserva confirmada para " + cli(cliente_encontrado) + ". Quedara esperando a que avise cuando tenga consola.")
             else:
                 send_message(ADMIN_PHONE, "No encontre un cliente con reserva pendiente con esos ultimos 4 digitos: " + ultimos_4)
             return jsonify({"status": "ok"}), 200
@@ -1423,7 +1494,7 @@ def webhook():
                 )
                 conversaciones[cliente_encontrado]["estado"] = "renovacion_espera_tiempo"
                 conversaciones[cliente_encontrado]["es_renovacion"] = True
-                send_message(ADMIN_PHONE, "✅ Opciones de pago de renovacion enviadas al cliente +" + cliente_encontrado)
+                send_message(ADMIN_PHONE, "✅ Opciones de pago de renovacion enviadas al cliente " + cli(cliente_encontrado))
             else:
                 send_message(ADMIN_PHONE, "No encontre un cliente esperando decision de renovacion con esos ultimos 4 digitos: " + ultimos_4)
             return jsonify({"status": "ok"}), 200
@@ -1440,7 +1511,7 @@ def webhook():
                 liberar_cuenta(cliente_encontrado)
                 asignacion_rv = asignar_cuenta(cliente_encontrado)
                 if not asignacion_rv:
-                    send_message(ADMIN_PHONE, "❌ No hay cuentas disponibles para asignar al cliente +" + cliente_encontrado + ". Agrega stock primero.")
+                    send_message(ADMIN_PHONE, "❌ No hay cuentas disponibles para asignar al cliente " + cli(cliente_encontrado) + ". Agrega stock primero.")
                     return jsonify({"status": "ok"}), 200
                 email_rv, password_rv, tipo_rv = asignacion_rv
                 conversaciones[cliente_encontrado]["tipo_cuenta"] = tipo_rv
@@ -1469,7 +1540,7 @@ def webhook():
                 )
                 send_message(cliente_encontrado, "REALIZA EL PAGO:\n\n" + mensaje_opciones_pago(link_rv))
                 send_message(ADMIN_PHONE,
-                    "✅ Nueva cuenta asignada al cliente +" + cliente_encontrado +
+                    "✅ Nueva cuenta asignada al cliente " + cli(cliente_encontrado) +
                     "\nEmail: " + email_rv + "\nTipo: " + tipo_rv
                 )
             else:
@@ -1481,7 +1552,7 @@ def webhook():
             for ph, datos in conversaciones.items():
                 if datos.get("estado") in ESTADOS_PENDIENTES:
                     pendientes.append(
-                        "+" + ph + " (..." + ph[-4:] + ") - " + str(datos.get("estado")) +
+                        "" + cli(ph) + " - " + str(datos.get("estado")) +
                         " - " + str(datos.get("meses")) + " - " + str(datos.get("tipo_cuenta"))
                     )
             if pendientes:
@@ -1491,13 +1562,51 @@ def webhook():
             send_message(ADMIN_PHONE, msg)
             return jsonify({"status": "ok"}), 200
 
+        # ── Revertir un avance automatico cuando el pago NO llego ────────────
+        if phone == ADMIN_PHONE and text_lower.startswith("anular"):
+            ultimos_4 = re.sub(r"\D", "", text_lower.replace("anular", ""))
+            cliente_encontrado = None
+            for ph, datos in conversaciones.items():
+                if ph.endswith(ultimos_4) and datos.get("estado") in (
+                    "esperando_consola", "pago_confirmado"
+                ):
+                    cliente_encontrado = ph
+                    break
+
+            if not cliente_encontrado:
+                send_message(ADMIN_PHONE,
+                    "No encontre un cliente con avance reciente con esos ultimos 4 digitos: " + ultimos_4)
+                return jsonify({"status": "ok"}), 200
+
+            datos_c = conversaciones[cliente_encontrado]
+            if datos_c.get("estado") == "esperando_consola":
+                datos_c["estado"] = "esperando_comprobante"
+                datos_c["reserva_pagada"] = False
+                datos_c["recordatorio_consola_at"] = None
+                aviso_admin = "Volvio a esperar el comprobante de la reserva."
+            else:
+                if datos_c.get("es_renovacion"):
+                    datos_c["estado"] = "renovacion_espera_pago"
+                else:
+                    datos_c["estado"] = "esperando_pago_final"
+                aviso_admin = ("Volvio a esperar el pago final.\n"
+                               "⚠️ Recuerda borrar la fila en la hoja *Compras* si ya se registro.")
+
+            send_message(cliente_encontrado,
+                "Hola! 👋 No logramos encontrar tu pago registrado.\n\n"
+                "Por favor verifica el comprobante y envialo de nuevo aqui para poder continuar 🙏"
+            )
+            send_message(ADMIN_PHONE,
+                "↩️ Avance anulado para " + cli(cliente_encontrado) + ".\n" + aviso_admin)
+            return jsonify({"status": "ok"}), 200
+
         # ── Comandos de bloqueo (solo admin) ─────────────────────────────────
         if phone == ADMIN_PHONE and text_lower.startswith("bloquear"):
             resto = text[len("bloquear"):].strip()
             if not resto:
                 send_message(ADMIN_PHONE,
                     "Uso del comando:\n\n"
-                    "🚫 *bloquear 3229082927 motivo*\n"
+                    "🚫 *bloquear 123456789 motivo*\n"
                     "🚫 *bloquear 2927 motivo* (ultimos 4 digitos de un cliente activo)\n\n"
                     "El motivo es opcional.")
                 return jsonify({"status": "ok"}), 200
@@ -1515,13 +1624,13 @@ def webhook():
                 elif len(candidatos) > 1:
                     send_message(ADMIN_PHONE,
                         "Hay varios clientes que terminan en " + solo_digitos + ":\n\n" +
-                        "\n".join("+" + c for c in candidatos) +
-                        "\n\nEnvia el numero completo para bloquear el correcto.")
+                        "\n".join(cli(c) for c in candidatos) +
+                        "\n\nEnvia el chat ID completo para bloquear el correcto.")
                     return jsonify({"status": "ok"}), 200
                 else:
                     send_message(ADMIN_PHONE,
                         "No encontre ningun cliente que termine en " + solo_digitos +
-                        ". Envia el numero completo.")
+                        ". Envia el chat ID completo.")
                     return jsonify({"status": "ok"}), 200
 
             ok, respuesta = bloquear_numero(objetivo, motivo)
@@ -1533,7 +1642,7 @@ def webhook():
         if phone == ADMIN_PHONE and text_lower.startswith("desbloquear"):
             objetivo = text[len("desbloquear"):].strip()
             if not objetivo:
-                send_message(ADMIN_PHONE, "Uso: *desbloquear 3229082927*")
+                send_message(ADMIN_PHONE, "Uso: *desbloquear 123456789*")
                 return jsonify({"status": "ok"}), 200
             ok, respuesta = desbloquear_numero(objetivo)
             send_message(ADMIN_PHONE, respuesta)
@@ -1546,7 +1655,7 @@ def webhook():
                 lineas = []
                 for telefono, datos in bloqueados.items():
                     lineas.append(
-                        "+" + telefono + " - " + str(datos.get("motivo", "")) +
+                        telefono + " - " + str(datos.get("motivo", "")) +
                         " (" + str(datos.get("fecha", "")) + ")"
                     )
                 send_message(ADMIN_PHONE,
@@ -1555,21 +1664,14 @@ def webhook():
             return jsonify({"status": "ok"}), 200
 
         saludos = ["hola", "buenas", "buenos dias", "buenas tardes", "buenas noches", "hi", "hello", "inicio"]
-        es_saludo = any(s in text_lower for s in saludos)
+        es_saludo = any(re.search(r"\b" + re.escape(s) + r"\b", text_lower) for s in saludos)
 
         if phone not in conversaciones:
-            conversaciones[phone] = {
-                "estado": "menu",
-                "historial": [],
-                "ultima_interaccion": time.time(),
-                "recordatorio_enviado": False,
-                "compro": False,
-                "meses": None,
-                "tipo_cuenta": None,
-                "bienvenida_enviada": False,
-                "ultimo_msg_id": ""
-            }
+            conversaciones[phone] = nueva_conversacion()
             registrar_evento_diario("nuevos")
+        conversaciones[phone]["nombre"] = (str(usuario_tg.get("first_name", "")) + " " +
+                                           str(usuario_tg.get("last_name", ""))).strip()
+        conversaciones[phone]["usuario"] = usuario_tg.get("username", "")
 
         if msg_id and msg_id == conversaciones[phone].get("ultimo_msg_id", ""):
             return jsonify({"status": "ok"}), 200
@@ -1582,14 +1684,41 @@ def webhook():
             conversaciones[phone]["ultima_interaccion"] = time.time()
             send_message(phone, BIENVENIDA)
             enviar_menu_principal(phone)
+            if not conversaciones[phone].get("telefono"):
+                pedir_telefono(phone)
             return jsonify({"status": "ok"}), 200
 
-        # Comando explicito para reiniciar al menu principal a proposito.
-        if text_lower == "menu":
+        # ── Palabras de escape: funcionan desde CUALQUIER estado ──────────────
+        # Es la salida de emergencia cuando el cliente siente que el bot no lo
+        # entiende. Debe ir antes de cualquier logica de estado.
+        PALABRAS_REINICIO = ("menu", "menú", "inicio", "reiniciar", "reinicio", "salir",
+                             "cancelar", "empezar de nuevo", "volver", "atras", "atrás",
+                             "regresar", "empezar", "otra cosa", "menu principal")
+        PALABRAS_ASESOR = ("asesor", "humano", "persona real", "hablar con alguien",
+                           "atencion personal", "atención personal", "agente",
+                           "hablar con una persona", "necesito ayuda de una persona")
+
+        if text_lower.strip() in PALABRAS_REINICIO or text_lower.strip() in ("menu", "menú"):
             conversaciones[phone]["estado"] = "menu"
             conversaciones[phone]["ultima_interaccion"] = time.time()
-            send_message(phone, "Volviendo al menu principal 🎮")
+            conversaciones[phone]["msgs_mismo_estado"] = 0
+            send_message(phone, "Listo, empecemos de nuevo 🎮")
             enviar_menu_principal(phone)
+            return jsonify({"status": "ok"}), 200
+
+        if not text_lower.startswith("sop_") and any(p in text_lower for p in PALABRAS_ASESOR):
+            conversaciones[phone]["estado"] = "soporte_asesor"
+            conversaciones[phone]["ultima_interaccion"] = time.time()
+            send_message(phone,
+                "Claro que si 🙌 Un asesor te va a escribir en breve.\n\n"
+                "Si prefieres escribirle tu directamente, este es su contacto: "
+                + ADMIN_PHONE_DISPLAY + "\n\n"
+                "Y si en algun momento quieres volver al menu, escribe *menu*."
+            )
+            send_message(ADMIN_PHONE,
+                "🙋 El cliente " + cli(phone) + " pidio hablar con un asesor.\n"
+                "Estado en el que estaba: " + str(conversaciones[phone].get("estado_anterior_registrado", "desconocido"))
+            )
             return jsonify({"status": "ok"}), 200
 
         # Un saludo NO debe borrar un proceso de compra en curso (esto causaba
@@ -1637,42 +1766,48 @@ def webhook():
         conversaciones[phone]["recordatorio_enviado"] = False
         estado = conversaciones[phone].get("estado", "menu")
 
+        # ── Detector de bucle ────────────────────────────────────────────────
+        # Si el cliente lleva varios mensajes sin que el estado avance, lo mas
+        # probable es que el bot no lo este entendiendo. Le ofrecemos la salida
+        # sin que tenga que adivinar ninguna palabra magica.
+        # "menu" se excluye porque ahi la conversacion libre es normal.
+        if estado == conversaciones[phone].get("estado_anterior_registrado"):
+            conversaciones[phone]["msgs_mismo_estado"] = conversaciones[phone].get("msgs_mismo_estado", 0) + 1
+        else:
+            conversaciones[phone]["estado_anterior_registrado"] = estado
+            conversaciones[phone]["msgs_mismo_estado"] = 1
+
+        if estado != "menu" and conversaciones[phone].get("msgs_mismo_estado", 0) >= 3:
+            conversaciones[phone]["msgs_mismo_estado"] = 0
+            send_message(phone,
+                "Parece que no estoy logrando ayudarte con lo que necesitas 😕\n\n"
+                "Dime como prefieres seguir 👇"
+            )
+            enviar_botones(phone, "Que quieres hacer?", [
+                {"id": "reiniciar_menu", "titulo": "🔄 Volver al menu"},
+                {"id": "sop_asesor", "titulo": "🙋 Hablar con asesor"}
+            ])
+            return jsonify({"status": "ok"}), 200
+
+        if text == "reiniciar_menu":
+            conversaciones[phone]["estado"] = "menu"
+            conversaciones[phone]["msgs_mismo_estado"] = 0
+            send_message(phone, "Listo, empecemos de nuevo 🎮")
+            enviar_menu_principal(phone)
+            return jsonify({"status": "ok"}), 200
+
         historial = conversaciones[phone].get("historial", [])
         meses = conversaciones[phone].get("meses", "No especificado")
         tipo_cuenta = conversaciones[phone].get("tipo_cuenta", "No especificado")
 
         if msg_type == "image":
-            if estado in ("esperando_pago_final", "pago_final_enviado", "renovacion_espera_pago", "esperando_comprobante"):
-                media_id = message["image"]["id"]
-                try:
-                    media_bytes, mime_type = descargar_media(media_id)
-                    analisis = leer_comprobante(media_bytes, mime_type)
-                except Exception as e:
-                    print("Error procesando imagen: " + str(e))
-                    analisis = "No pude leer el comprobante automaticamente, revisa la imagen manualmente."
-
-                if estado == "renovacion_espera_pago":
-                    conversaciones[phone]["estado"] = "renovacion_comprobante_enviado"
-                    send_message(phone, "Comprobante recibido! Un asesor lo confirmara en breve. Gracias 🎮🙌")
-                    etiqueta = "COMPROBANTE RENOVACION"
-                    comando_confirmacion = "pagook " + phone[-4:]
-                elif estado == "esperando_comprobante":
-                    conversaciones[phone]["estado"] = "comprobante_reserva_enviado"
-                    send_message(phone, "Comprobante recibido! Un asesor confirmara tu reserva en breve. Gracias 🎮🙌")
-                    etiqueta = "COMPROBANTE DE RESERVA"
-                    comando_confirmacion = "reservaok " + phone[-4:]
-                else:
-                    conversaciones[phone]["estado"] = "pago_final_enviado"
-                    send_message(phone, "Comprobante recibido! Un asesor confirmara tu pago en breve. Gracias por tu compra 🎮🙌")
-                    etiqueta = "COMPROBANTE DE PAGO"
-                    comando_confirmacion = "pagook " + phone[-4:]
-
-                reenviar_imagen(ADMIN_PHONE, media_id)
-                alerta = (etiqueta + " Game Line Col\nCliente: +" + phone +
-                          "\nPlan: " + meses + " - " + tipo_cuenta +
-                          "\n\nLectura automatica:\n" + analisis +
-                          "\n\nResponde: " + comando_confirmacion + " para confirmar.")
-                send_message(ADMIN_PHONE, alerta)
+            if estado in ("esperando_pago_final", "pago_final_enviado", "renovacion_espera_pago",
+                          "renovacion_comprobante_enviado", "esperando_comprobante",
+                          "comprobante_reserva_enviado"):
+                # El comprobante llega aqui y se le reenvia al admin para verificarlo.
+                reenviar_imagen(ADMIN_PHONE, foto_id, "🧾 Comprobante de " + cli(phone) + "\nEstado: " + estado)
+                send_message(phone, "Gracias! 🙌 Recibimos tu comprobante, nuestro asesor lo verificara.")
+                avanzar_tras_pago(phone, estado)
             else:
                 send_message(phone, "Recibimos tu imagen, pero en este momento no la necesitamos. Si tienes alguna duda escribenos 😊")
             return jsonify({"status": "ok"}), 200
@@ -1726,7 +1861,7 @@ def webhook():
                         "Un asesor te contactara pronto para buscar una solucion."
                     )
                     send_message(ADMIN_PHONE,
-                        "🚨 Sin stock - Game Line Col\nCliente +" + phone +
+                        "🚨 Sin stock - Game Line Col\nCliente " + cli(phone) +
                         " quiso contratar " + meses + " pero no hay cuentas disponibles."
                     )
                     conversaciones[phone]["estado"] = "menu"
@@ -1770,7 +1905,7 @@ def webhook():
 
                 send_message(ADMIN_PHONE,
                     "🎮 NUEVA ASIGNACION Game Line Col\n"
-                    "Cliente: +" + phone + "\nPlan: " + meses + " - Cuenta " + tipo_asig +
+                    "Cliente: " + cli(phone) + "\nPlan: " + meses + " - Cuenta " + tipo_asig +
                     "\n\n📧 Email: " + email_asig +
                     "\n🔒 Contraseña: " + password_asig +
                     "\n\nVerifica que esta cuenta ya este canjeada (con Game Pass activo) antes de que el cliente la use."
@@ -1782,9 +1917,9 @@ def webhook():
                     fecha = datetime.now().strftime("%d/%m/%Y %H:%M")
                     service.spreadsheets().values().append(
                         spreadsheetId=SHEET_ID,
-                        range="Compras!A:E",
+                        range="Compras!A:F",
                         valueInputOption="RAW",
-                        body={"values": [["+" + phone, fecha, tipo_asig, meses, email_asig + " (pendiente pago)"]]}
+                        body={"values": [[str(phone), fecha, tipo_asig, meses, email_asig + " (pendiente pago)", cli(phone)]]}
                     ).execute()
                 except Exception as e:
                     print("Error registrando asignacion: " + str(e))
@@ -1808,7 +1943,7 @@ def webhook():
                     + mensaje_opciones_pago(link_rsv)
                 )
                 send_message(ADMIN_PHONE,
-                    "📌 RESERVA Game Line Col\nCliente: +" + phone + "\nPlan: " + meses +
+                    "📌 RESERVA Game Line Col\nCliente: " + cli(phone) + "\nPlan: " + meses +
                     "\n\nEl cliente aun no tiene consola/PC disponible. Pago pendiente para apartar el cupo."
                 )
             else:
@@ -1823,7 +1958,7 @@ def webhook():
                 conversaciones[phone]["estado"] = "renovacion_espera_admin"
                 send_message(phone, "Perfecto! En un momento te confirmamos los detalles para tu renovacion 🎮")
                 send_message(ADMIN_PHONE,
-                    "🔄 RENOVACION Game Line Col\nCliente: +" + phone +
+                    "🔄 RENOVACION Game Line Col\nCliente: " + cli(phone) +
                     "\nServicio actual: " + tipo_rv + " - " + meses_rv +
                     "\n\nResponde:\n✅ misma " + phone[-4:] + " → Misma cuenta\n🔄 cambia " + phone[-4:] + " → Cambiar cuenta"
                 )
@@ -1852,24 +1987,13 @@ def webhook():
             )
             return jsonify({"status": "ok"}), 200
 
-        if estado == "renovacion_espera_pago":
-            send_message(phone, "Cuando hayas pagado, envianos la foto del comprobante aqui 📸")
-            return jsonify({"status": "ok"}), 200
-
-        if estado == "renovacion_comprobante_enviado":
-            send_message(phone, "Ya recibimos tu comprobante, un asesor lo esta confirmando ⏳")
-            return jsonify({"status": "ok"}), 200
-
-        if estado == "esperando_pago_final":
-            send_message(phone, "Cuando hayas pagado, envianos la foto del comprobante aqui 📸")
-            return jsonify({"status": "ok"}), 200
-
-        if estado == "esperando_comprobante":
-            send_message(phone, "Cuando hayas pagado la reserva, envianos la foto del comprobante aqui 📸")
-            return jsonify({"status": "ok"}), 200
-
-        if estado == "comprobante_reserva_enviado":
-            send_message(phone, "Ya recibimos el comprobante de tu reserva, un asesor lo esta confirmando ⏳")
+        if estado in ("renovacion_espera_pago", "renovacion_comprobante_enviado",
+                      "esperando_pago_final", "pago_final_enviado",
+                      "esperando_comprobante", "comprobante_reserva_enviado"):
+            if text_lower.strip() in CONFIRMACIONES_PAGO:
+                avanzar_tras_pago(phone, estado)
+            else:
+                send_message(phone, RECORDAR_COMPROBANTE_ADMIN)
             return jsonify({"status": "ok"}), 200
 
         # ── CLIENTE CON RESERVA PAGADA CONFIRMA QUE YA TIENE CONSOLA/PC ─────
@@ -1887,7 +2011,7 @@ def webhook():
                         "Ya avisamos a un asesor para resolverlo lo antes posible, tu reserva sigue vigente."
                     )
                     send_message(ADMIN_PHONE,
-                        "🚨 URGENTE - Sin stock para reserva ya pagada\nCliente +" + phone +
+                        "🚨 URGENTE - Sin stock para reserva ya pagada\nCliente " + cli(phone) +
                         " confirmo que ya tiene consola (" + meses + ") pero no hay cuentas disponibles. Resolver manualmente."
                     )
                     return jsonify({"status": "ok"}), 200
@@ -1917,7 +2041,7 @@ def webhook():
 
                 send_message(ADMIN_PHONE,
                     "🎮 RESERVA ENTREGADA Game Line Col\n"
-                    "Cliente: +" + phone + "\nPlan: " + meses + " - Cuenta " + tipo_asig +
+                    "Cliente: " + cli(phone) + "\nPlan: " + meses + " - Cuenta " + tipo_asig +
                     "\n\n📧 Email: " + email_asig +
                     "\n🔒 Contraseña: " + password_asig +
                     "\n\nYa estaba pagada. Verifica que la cuenta este canjeada antes de que el cliente la use."
@@ -1952,7 +2076,7 @@ def webhook():
         # ── SOPORTE: botones sop_* (se procesan ANTES que el menú principal) ─
         SOP_IDS = {"sop_online", "sop_online_p", "sop_online_s",
                    "sop_online_p_marcada", "sop_online_p_no_marcada",
-                   "sop_online_p3", "sop_jugando", "sop_jugando_p",
+                   "sop_online_p3", "sop_online_p4", "sop_jugando", "sop_jugando_p",
                    "sop_jugando_s", "sop_password", "sop_resuelto", "sop_asesor"}
 
         # Mapeo de texto libre a IDs de botón para que el bot entienda aunque no toque el botón
@@ -1981,13 +2105,17 @@ def webhook():
                 elif any(p in tl for p in ["no", "desmarcada", "sin marcar"]):
                     if estado == "sop_online_p1":
                         text = "sop_online_p_no_marcada"
-                elif any(p in tl for p in ["funciona", "listo", "ya", "bien", "ok", "resuelto"]):
-                    text = "sop_resuelto"
-                elif any(p in tl for p in ["sigue", "error", "persiste", "todavia", "todavía"]):
+                elif any(p in tl for p in ["sigue", "error", "persiste", "todavia", "todavía",
+                                           "tampoco", "nada", "no funciona", "no sirve",
+                                           "no me funciona", "igual", "sigue igual"]):
                     if estado == "sop_online_p2":
                         text = "sop_online_p3"
+                    elif estado == "sop_online_p3":
+                        text = "sop_online_p4"
                     else:
                         text = "sop_asesor"
+                elif any(p in tl for p in ["funciona", "listo", "ya", "bien", "ok", "resuelto"]):
+                    text = "sop_resuelto"
 
             if text == "sop_online":
                 conversaciones[phone]["estado"] = "sop_online"
@@ -2046,6 +2174,37 @@ def webhook():
                     "Vuelve a probar. Como te fue?"
                 )
                 enviar_botones(phone, "Resultado:", [
+                    {"id": "sop_resuelto", "titulo": "🎉 Ya funciona!"},
+                    {"id": "sop_online_p4", "titulo": "Sigue el error"}
+                ])
+                return jsonify({"status": "ok"}), 200
+
+            if text == "sop_online_p4":
+                conversaciones[phone]["estado"] = "sop_online_p4"
+                send_message(phone,
+                    "Tranquilo, ya sabemos que esta pasando 🙌\n\n"
+                    "Tu cuenta esta perfecta de nuestro lado. Lo que ocurre es que *tu consola* "
+                    "guardo mal la configuracion del servicio online, y hay que reiniciarla por completo.\n\n"
+                    "Es un procedimiento un poco mas largo, pero con este queda resuelto. "
+                    "Sigue los pasos en orden y sin saltarte ninguno 👇"
+                )
+                send_message(phone,
+                    "🎮 *PASOS PARA ACTIVAR CORRECTAMENTE EL SERVICIO ONLINE EN TU XBOX*\n\n"
+                    "1️⃣ Inicia sesion con la *cuenta de Game Pass Ultimate*.\n\n"
+                    "2️⃣ Ve a *Configuracion > Personalizacion > Mi Xbox principal*.\n\n"
+                    "3️⃣ *Desmarca* la opcion \"Mi Xbox principal\", confirma la eliminacion y "
+                    "*reinicia la consola*.\n\n"
+                    "4️⃣ Cuando la consola reinicie, vuelve a iniciar sesion con la *cuenta de Game Pass "
+                    "Ultimate* y repite la ruta:\n"
+                    "*Configuracion > Personalizacion > Mi Xbox principal*\n"
+                    "Esta vez *marca* la opcion \"Mi Xbox principal\" y dejala activada.\n\n"
+                    "5️⃣ Luego ve a *Configuracion > Red > Configuracion avanzada > Direccion MAC "
+                    "alternativa*. Selecciona *Borrar/Limpiar* y *reinicia la consola*.\n\n"
+                    "6️⃣ Al encender nuevamente la consola, inicia sesion *unicamente con tu cuenta "
+                    "personal*. ⚠️ NO inicies sesion con la cuenta de Game Pass Ultimate.\n\n"
+                    "Finalmente, prueba nuevamente el servicio online 🚀"
+                )
+                enviar_botones(phone, "Como te fue?", [
                     {"id": "sop_resuelto", "titulo": "🎉 Ya funciona!"},
                     {"id": "sop_asesor", "titulo": "Sigue el error"}
                 ])
@@ -2120,7 +2279,7 @@ def webhook():
                 conversaciones[phone]["estado"] = "soporte_asesor"
                 send_message(phone, "Entendido, vamos a pasarte con un asesor que te ayudara personalmente 🙏\n\nEn breve te contactamos.")
                 estado_desc = conversaciones[phone].get("estado", "desconocido")
-                alerta = ("🛠️ SOPORTE - ESCALADO AL ASESOR\nCliente: +" + phone +
+                alerta = ("🛠️ SOPORTE - ESCALADO AL ASESOR\nCliente: " + cli(phone) +
                           "\nUltimo estado: " + estado_desc +
                           "\nContactalo para ayudarlo manualmente.")
                 send_message(ADMIN_PHONE, alerta)
@@ -2178,16 +2337,16 @@ def webhook():
             nombre_juego = match.group(1).strip() if match else text
             reply = re.sub(r'ALERTA_JUEGO:[^\n]+', '', reply).strip()
             conversaciones[phone]["compro"] = True
-            alerta = "COTIZACION Game Line Col\nCliente: +" + phone + "\nJuego: " + nombre_juego
+            alerta = "COTIZACION Game Line Col\nCliente: " + cli(phone) + "\nJuego: " + nombre_juego
             send_message(ADMIN_PHONE, alerta)
         elif "ALERTA_ASESOR" in reply:
             reply = reply.replace("ALERTA_ASESOR", "").strip()
-            alerta = "ALERTA ASESOR Game Line Col\nCliente: +" + phone + "\nPregunta: " + text
+            alerta = "ALERTA ASESOR Game Line Col\nCliente: " + cli(phone) + "\nPregunta: " + text
             send_message(ADMIN_PHONE, alerta)
 
         historial.append({"role": "assistant", "content": reply})
         conversaciones[phone]["historial"] = historial[-20:]
-        send_message(phone, reply)
+        send_message(phone, reply, formato=False)
 
     except Exception as e:
         print("Error: " + str(e))
@@ -2224,6 +2383,7 @@ def mercadopago_webhook():
                     if tipo_pago == "reserva":
                         conversaciones[phone_pagador]["estado"] = "esperando_consola"
                         conversaciones[phone_pagador]["reserva_pagada"] = True
+                        conversaciones[phone_pagador]["compro"] = True
                         conversaciones[phone_pagador]["recordatorio_consola_at"] = time.time() + HORA_RECORDATORIO_CONSOLA
                         enviar_boton_consola_lista(phone_pagador,
                             "✅ Pago de tu reserva confirmado automaticamente!\n\n"
@@ -2238,10 +2398,10 @@ def mercadopago_webhook():
                         etiqueta_mp = "ACTIVACION FINAL"
                         tipo_cuenta_mp = datos_cliente.get("tipo_cuenta", "No especificado")
                         meses_mp = datos_cliente.get("meses", "No especificado")
-                        registrar_compra(phone_pagador, tipo_cuenta_mp, meses_mp)
+                        registrar_compra(phone_pagador, tipo_cuenta_mp, meses_mp, datos_cliente.get("email_cuenta", ""))
                         registrar_evento_diario("cierres")
 
-                    send_message(ADMIN_PHONE, "✅ Pago confirmado automaticamente por Mercado Pago (" + etiqueta_mp + ")\nCliente: +" + phone_pagador + "\nMonto: $" + str(monto_pagado))
+                    send_message(ADMIN_PHONE, "✅ Pago confirmado automaticamente por Mercado Pago (" + etiqueta_mp + ")\nCliente: " + cli(phone_pagador) + "\nMonto: $" + str(monto_pagado))
     except Exception as e:
         print("Error webhook Mercado Pago: " + str(e))
     return jsonify({"status": "ok"}), 200
