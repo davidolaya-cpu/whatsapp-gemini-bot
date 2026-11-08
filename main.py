@@ -30,6 +30,8 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_API = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN
 ADMIN_PHONE = str(os.environ.get("ADMIN_CHAT_ID", "")).strip()
 ADMIN_PHONE_DISPLAY = os.environ.get("ADMIN_CONTACTO", "+57 322 908 2927")
+WHATSAPP_LINK_CORTO = "https://wa.me/573229082927"
+WHATSAPP_URL = "https://wa.me/573229082927?text=Hola%20Game%20Line%20Col%2C%20vengo%20de%20Telegram%20y%20necesito%20ayuda%20%F0%9F%8E%AE"
 PUBLIC_DOMAIN = os.environ.get("PUBLIC_DOMAIN") or os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
 TELEGRAM_SECRET = os.environ.get("TELEGRAM_SECRET") or hashlib.sha256(
     ("gamebot-" + TELEGRAM_BOT_TOKEN).encode("utf-8")).hexdigest()[:40]
@@ -341,7 +343,8 @@ def normalizar_numero(texto):
     return digitos
 
 
-def cli(ph):
+def cli_sheet(ph):
+    """Resumen en una sola linea para guardar en Google Sheets."""
     datos = conversaciones.get(str(ph), {})
     partes = []
     if datos.get("nombre"):
@@ -352,6 +355,65 @@ def cli(ph):
         partes.append("tel +" + datos["telefono"])
     base = " ".join(partes) if partes else "Cliente"
     return base + " (ID " + str(ph) + ")"
+
+
+def cli(ph):
+    """Etiqueta del cliente para el admin con enlaces directos a WhatsApp y Telegram."""
+    datos = conversaciones.get(str(ph), {})
+    nombre = datos.get("nombre") or "Cliente"
+    usuario = datos.get("usuario", "")
+    telefono = datos.get("telefono", "")
+
+    partes = [nombre]
+    if usuario:
+        partes.append("@" + usuario)
+    partes.append("(ID " + str(ph) + ")")
+    cabecera = " ".join(partes)
+
+    enlaces = []
+    if telefono:
+        enlaces.append("📲 WA: https://wa.me/" + telefono)
+    else:
+        enlaces.append("📲 WA: Sin registrar")
+
+    if usuario:
+        enlaces.append("💬 TG: https://t.me/" + usuario)
+    else:
+        enlaces.append("💬 TG: tg://user?id=" + str(ph))
+
+    return cabecera + "\n" + " | ".join(enlaces)
+
+
+def botones_cliente_admin(ph):
+    """Genera el teclado inline con botones directos al WhatsApp y Telegram del cliente."""
+    ph_str = str(ph)
+    datos = conversaciones.get(ph_str, {})
+    telefono = datos.get("telefono", "")
+    usuario = datos.get("usuario", "")
+    filas = []
+    if telefono:
+        filas.append([{"text": "📲 WhatsApp Cliente (+" + telefono + ")", "url": "https://wa.me/" + telefono}])
+    if usuario:
+        filas.append([{"text": "💬 Telegram Cliente (@" + usuario + ")", "url": "https://t.me/" + usuario}])
+    else:
+        filas.append([{"text": "💬 Abrir Telegram del Cliente", "url": "tg://user?id=" + ph_str}])
+    return {"inline_keyboard": filas} if filas else None
+
+
+def extraer_telefono_cliente(texto):
+    """Detecta si el cliente escribio su numero celular en el chat."""
+    if not texto:
+        return ""
+    limpio = re.sub(r"[\s\-\.\(\)]", "", str(texto))
+    # Buscar numero colombiano de 10 digitos que empiece por 3 (con o sin +57 / 57)
+    match = re.search(r"(?:\+?57)?(3\d{9})(?!\d)", limpio)
+    if match:
+        num = "57" + match.group(1)
+        # Evitar confundir con los numeros propios de la tienda/admin
+        if num in ("573057059517", "573229082927"):
+            return ""
+        return num
+    return ""
 
 
 def primer_nombre(ph):
@@ -508,7 +570,7 @@ def registrar_compra(phone, tipo_cuenta, meses, email_cuenta=""):
     try:
         service = get_sheets_service()
         fecha = ahora_col().strftime("%d/%m/%Y %H:%M")
-        valores = [[str(phone), fecha, tipo_cuenta, meses, email_cuenta, cli(phone)]]
+        valores = [[str(phone), fecha, tipo_cuenta, meses, email_cuenta, cli_sheet(phone)]]
         service.spreadsheets().values().append(
             spreadsheetId=SHEET_ID,
             range="Compras!A:F",
@@ -552,6 +614,21 @@ def _tg(metodo, payload, intentos=3):
             if codigo == 400 and "parse" in descripcion.lower() and payload.get("parse_mode"):
                 payload.pop("parse_mode", None)
                 continue
+            # Si el cliente tiene privacidad estricta en Telegram que bloquea tg://user?id= en botones,
+            # dejamos solo los botones https:// (como WhatsApp) o enviamos sin reply_markup.
+            if codigo == 400 and payload.get("reply_markup") and ("button" in descripcion.lower() or "url" in descripcion.lower()):
+                rm = payload.get("reply_markup", {})
+                if isinstance(rm, dict) and "inline_keyboard" in rm:
+                    filas_https = [
+                        [b for b in fila if not str(b.get("url", "")).startswith("tg://")]
+                        for fila in rm["inline_keyboard"]
+                    ]
+                    filas_https = [f for f in filas_https if f]
+                    if filas_https and len(filas_https) < len(rm["inline_keyboard"]):
+                        payload["reply_markup"] = {"inline_keyboard": filas_https}
+                        continue
+                payload.pop("reply_markup", None)
+                continue
             print("Telegram error en " + metodo + " (intento " + str(intento + 1) + "): " + descripcion)
             if codigo == 401:
                 alertar_token_vencido(ultimo)
@@ -586,6 +663,11 @@ def mostrar_escribiendo(phone):
 def send_message(phone, message, intentos=3, formato=True, reply_markup=None):
     if not _destino_valido(phone):
         return False
+    # Si es un mensaje al ADMIN que menciona a un cliente (ID ...), adjuntamos botones directos a su WA y TG
+    if str(phone) == ADMIN_PHONE and reply_markup is None and message:
+        ids_encontrados = re.findall(r"\(ID (\d+)\)", str(message))
+        if len(ids_encontrados) == 1:
+            reply_markup = botones_cliente_admin(ids_encontrados[0])
     payload = {"chat_id": phone, "text": message, "disable_web_page_preview": True}
     if formato:
         payload["parse_mode"] = "Markdown"
@@ -597,7 +679,14 @@ def send_message(phone, message, intentos=3, formato=True, reply_markup=None):
 def reenviar_imagen(phone, media_id, caption="", intentos=2):
     if not _destino_valido(phone):
         return False
-    r = _tg("sendPhoto", {"chat_id": phone, "photo": media_id, "caption": caption}, intentos)
+    payload = {"chat_id": phone, "photo": media_id, "caption": caption}
+    if str(phone) == ADMIN_PHONE and caption:
+        ids_encontrados = re.findall(r"\(ID (\d+)\)", str(caption))
+        if len(ids_encontrados) == 1:
+            rm = botones_cliente_admin(ids_encontrados[0])
+            if rm:
+                payload["reply_markup"] = rm
+    r = _tg("sendPhoto", payload, intentos)
     if not r:
         send_message(ADMIN_PHONE, "⚠️ No pude reenviarte una foto de comprobante. Pidele al cliente que la reenvie.")
     return r
@@ -606,7 +695,13 @@ def reenviar_imagen(phone, media_id, caption="", intentos=2):
 def enviar_botones(phone, cuerpo, botones, intentos=3):
     if not _destino_valido(phone):
         return False
-    teclado = {"inline_keyboard": [[{"text": b["titulo"], "callback_data": b["id"]}] for b in botones]}
+    filas_teclado = []
+    for b in botones:
+        if "url" in b:
+            filas_teclado.append([{"text": b["titulo"], "url": b["url"]}])
+        else:
+            filas_teclado.append([{"text": b["titulo"], "callback_data": b["id"]}])
+    teclado = {"inline_keyboard": filas_teclado}
     r = send_message(phone, cuerpo, intentos, reply_markup=teclado)
     return r or send_message(phone, cuerpo)
 
@@ -628,16 +723,20 @@ def enviar_documento(phone, media_id, caption="", nombre_archivo="Catalogo_Game_
     return r
 
 
-def pedir_telefono(phone):
-    send_message(phone,
-        "📱 Por cierto, si ya venías siendo cliente nuestro por WhatsApp, puedes tocar el botón de abajo "
-        "para compartir tu número y vincular tu plan automáticamente (es opcional).",
-        reply_markup={
-            "keyboard": [[{"text": "📱 Compartir mi numero", "request_contact": True}]],
-            "resize_keyboard": True,
-            "one_time_keyboard": True
-        }
+def pedir_telefono(phone, texto_extra=""):
+    if conversaciones.get(str(phone), {}).get("telefono"):
+        return
+    mensaje = (
+        (texto_extra + "\n\n" if texto_extra else "") +
+        "📱 *¿Me regalas tu número de contacto (WhatsApp)?*\n\n"
+        "Así podemos registrarte tu garantía, vincular tu cuenta o contactarte rápido si nos necesitas. "
+        "Puedes tocar el botón *📱 Compartir mi número* de abajo o *escribir tu número aquí en el chat* (ej: 3001234567) 👇"
     )
+    send_message(phone, mensaje, reply_markup={
+        "keyboard": [[{"text": "📱 Compartir mi numero", "request_contact": True}]],
+        "resize_keyboard": True,
+        "one_time_keyboard": True
+    })
 
 
 def responder_callback(callback_id):
@@ -1115,7 +1214,7 @@ INFORMACIÓN OFICIAL DE GAME LINE COL (NUNCA INVENTES PRECIOS FUERA DE ESTOS):
 
 REGLAS CRÍTICAS DE ETIQUETAS:
 - Si el cliente cotiza o pide comprar un juego específico individual, termina tu mensaje con: ALERTA_JUEGO:[nombre del juego]
-- Si el cliente tiene un problema técnico complejo de su cuenta, un reclamo de dinero, o algo que requiera intervención del dueño, termina tu mensaje con: ALERTA_ASESOR
+- Si el cliente pide soporte personalizado, hablar con un asesor o tiene un problema técnico complejo, compártele también el enlace directo de nuestro WhatsApp de soporte (https://wa.me/573229082927) y termina tu mensaje con: ALERTA_ASESOR
 - Si el cliente quiere contratar Game Pass y está en conversación libre, anímalo a elegir cuántos meses quiere (1, 2, 3, 6 o 12 meses)."""
 
 ESTADO_CLIENTE_MENSAJE = {
@@ -1123,6 +1222,7 @@ ESTADO_CLIENTE_MENSAJE = {
     "gamepass": "Estábamos viendo los planes de Game Pass Ultimate. Dime si te animas a probarlo o si tienes alguna duda 😊",
     "seleccion_meses": "Estamos en la elección de tu plan. Cuéntame cuántos meses prefieres (1, 2, 3, 6 o 12 meses) o hazme cualquier pregunta.",
     "confirmacion_compra": "Estamos por confirmar tu plan de Game Pass Ultimate. Toca el botón de confirmar o dime si tienes alguna duda antes.",
+    "pedir_contacto_compra": "Estamos esperando que nos compartas o escribas tu número de WhatsApp para continuar con la entrega de tu cuenta 📱",
     "seleccion_cuenta": "Estamos esperando que elijas el tipo de cuenta (Principal o Secundaria).",
     "preguntar_consola": "Te preguntaba si tienes tu consola o PC a la mano ahora mismo para entregarte la cuenta de una vez 🎮",
     "activacion": "Estamos esperando el código de activación de tu consola. Envíalo aquí cuando lo tengas 🎮",
@@ -1205,6 +1305,8 @@ def responder_con_ia(phone, text, contexto_extra=""):
     historial.append({"role": "assistant", "content": reply})
     conversaciones[phone]["historial"] = historial[-20:]
     send_message(phone, reply, formato=False)
+    if ("ALERTA_JUEGO:" in (response.text or "") or "ALERTA_ASESOR" in (response.text or "")) and not conversaciones[phone].get("telefono"):
+        pedir_telefono(phone, "📲 *Por favor déjanos tu número de WhatsApp* para que el asesor te contacte más rápido:")
 
 
 def enviar_menu_principal(phone):
@@ -1259,18 +1361,19 @@ def nueva_conversacion():
     }
 
 
-def vincular_telefono(chat_id, contacto, usuario_tg):
+def registrar_telefono_cliente(chat_id, telefono, usuario_tg, silencioso=False):
+    """Guarda el numero del cliente (compartido por boton o escrito en texto),
+    migra datos si venia de WhatsApp, notifica al admin con enlaces directos y continua el flujo."""
     quitar = {"remove_keyboard": True}
-    if contacto.get("user_id") and str(contacto.get("user_id")) != str(usuario_tg.get("id")):
-        send_message(chat_id, "Por seguridad, comparte *tu propio* número tocando el botón de abajo 📱", reply_markup=quitar)
-        return
-    telefono = normalizar_numero(contacto.get("phone_number", ""))
+    telefono = normalizar_numero(telefono)
     if not telefono:
         return
     datos = conversaciones.setdefault(chat_id, nueva_conversacion())
+    ya_tenia = datos.get("telefono") == telefono
     datos["telefono"] = telefono
-    datos["nombre"] = (str(usuario_tg.get("first_name", "")) + " " + str(usuario_tg.get("last_name", ""))).strip()
-    datos["usuario"] = usuario_tg.get("username", "")
+    if usuario_tg:
+        datos["nombre"] = (str(usuario_tg.get("first_name", "")) + " " + str(usuario_tg.get("last_name", ""))).strip()
+        datos["usuario"] = usuario_tg.get("username", "")
 
     encontrado = []
     if telefono in renovaciones and chat_id not in renovaciones:
@@ -1292,18 +1395,49 @@ def vincular_telefono(chat_id, contacto, usuario_tg):
             if not encontrado:
                 encontrado.append("tu cuenta asignada")
 
+    if not ya_tenia:
+        if encontrado:
+            send_message(ADMIN_PHONE, "🔗 Cliente de WhatsApp vinculado a Telegram:\n" + cli(chat_id))
+        else:
+            send_message(ADMIN_PHONE, "📲 *Número de contacto registrado*\nCliente: " + cli(chat_id))
+
+    if silencioso:
+        return
+
     if encontrado:
         send_message(chat_id,
             "✅ ¡Qué alegría tenerte por aquí! Ya te reconocimos y vinculamos " + " y ".join(encontrado) + ".\n\n"
             "Desde ahora te avisaremos por este chat cuando tu servicio esté próximo a vencer 🎮",
             reply_markup=quitar)
-        send_message(ADMIN_PHONE, "🔗 Cliente de WhatsApp vinculado a Telegram: " + cli(chat_id))
     else:
-        send_message(chat_id, "✅ ¡Listo, muchas gracias! Ya dejamos tu número registrado en tu ficha.", reply_markup=quitar)
+        send_message(chat_id, "✅ ¡Listo, muchas gracias! Ya dejamos tu número (+ " + telefono + ") registrado.", reply_markup=quitar)
+
     if not datos.get("bienvenida_enviada"):
         datos["bienvenida_enviada"] = True
         send_message(chat_id, texto_bienvenida(chat_id))
         enviar_menu_principal(chat_id)
+        return
+
+    # Si estaba en el paso previo a entregar cuenta, avanza de inmediato a preguntar por la consola
+    if datos.get("estado") == "pedir_contacto_compra":
+        datos["estado"] = "preguntar_consola"
+        datos["msgs_mismo_estado"] = 0
+        enviar_pregunta_consola(chat_id)
+    elif datos.get("estado") == "preguntar_consola":
+        enviar_pregunta_consola(chat_id)
+    elif datos.get("estado") == "seleccion_meses":
+        enviar_pregunta_meses(chat_id)
+
+
+def vincular_telefono(chat_id, contacto, usuario_tg):
+    quitar = {"remove_keyboard": True}
+    if contacto.get("user_id") and str(contacto.get("user_id")) != str(usuario_tg.get("id")):
+        send_message(chat_id, "Por seguridad, comparte *tu propio* número tocando el botón de abajo o escríbelo en el chat 📱", reply_markup=quitar)
+        return
+    telefono = normalizar_numero(contacto.get("phone_number", ""))
+    if not telefono:
+        return
+    registrar_telefono_cliente(chat_id, telefono, usuario_tg, silencioso=False)
 
 
 def enviar_boton_consola_lista(phone, mensaje):
@@ -1590,14 +1724,32 @@ def webhook():
             for ph, datos in conversaciones.items():
                 if datos.get("estado") in ESTADOS_PENDIENTES:
                     pendientes.append(
-                        "" + cli(ph) + " - " + str(datos.get("estado")) +
-                        " - " + str(datos.get("meses")) + " - " + str(datos.get("tipo_cuenta"))
+                        "• " + cli(ph) + "\n  Estado: " + str(datos.get("estado")) +
+                        " | Plan: " + str(datos.get("meses")) + " | Cuenta: " + str(datos.get("tipo_cuenta"))
                     )
             if pendientes:
-                msg = "📋 Clientes pendientes (" + str(len(pendientes)) + "):\n\n" + "\n".join(pendientes)
+                msg = "📋 Clientes pendientes (" + str(len(pendientes)) + "):\n\n" + "\n\n".join(pendientes)
             else:
                 msg = "No hay clientes pendientes en este momento 🎉"
             send_message(ADMIN_PHONE, msg)
+            return jsonify({"status": "ok"}), 200
+
+        if phone == ADMIN_PHONE and (text_lower.startswith("contacto") or text_lower.startswith("cliente")):
+            ultimos_4 = re.sub(r"\D", "", text_lower)
+            if not ultimos_4:
+                send_message(ADMIN_PHONE, "Uso: *contacto 1234* (ultimos 4 digitos o ID del cliente)")
+                return jsonify({"status": "ok"}), 200
+            candidatos = [ph for ph in conversaciones if ph.endswith(ultimos_4)]
+            if not candidatos:
+                send_message(ADMIN_PHONE, "No encontre ningun cliente activo que termine en: " + ultimos_4)
+            else:
+                for c_id in candidatos:
+                    d_c = conversaciones.get(c_id, {})
+                    send_message(ADMIN_PHONE,
+                        "👤 *Ficha de Contacto del Cliente*\n" + cli(c_id) +
+                        "\nEstado actual: " + str(d_c.get("estado", "menu")) +
+                        "\nPlan: " + str(d_c.get("meses", "No especificado"))
+                    )
             return jsonify({"status": "ok"}), 200
 
         if phone == ADMIN_PHONE and text_lower.startswith("anular"):
@@ -1715,6 +1867,22 @@ def webhook():
             return jsonify({"status": "ok"}), 200
         conversaciones[phone]["ultimo_msg_id"] = msg_id
 
+        # ── Detectar si el cliente escribió su número de teléfono en texto ───
+        if msg_type == "text" and phone != ADMIN_PHONE:
+            tel_texto = extraer_telefono_cliente(text)
+            if tel_texto:
+                # Contar cuántas palabras adicionales hay además del número
+                texto_sin_num = re.sub(r"[\d\s\+\-\.\(\)]", "", text_lower).strip()
+                palabras_extra = [p for p in texto_sin_num.split() if p not in (
+                    "mi", "numero", "número", "es", "whatsapp", "wa", "cel", "celular",
+                    "telefono", "teléfono", "contacto", "este", "hola", "listo", "el"
+                )]
+                if conversaciones[phone].get("estado") == "pedir_contacto_compra" or len(palabras_extra) <= 2:
+                    registrar_telefono_cliente(phone, tel_texto, usuario_tg, silencioso=False)
+                    return jsonify({"status": "ok"}), 200
+                else:
+                    registrar_telefono_cliente(phone, tel_texto, usuario_tg, silencioso=True)
+
         # Cliente totalmente nuevo: si escribe un saludo simple le damos la bienvenida;
         # si de entrada hace una pregunta específica ("hola tienes fifa 25?"), le damos la bienvenida
         # y además le respondemos su pregunta con IA para que sienta atención humana.
@@ -1750,13 +1918,16 @@ def webhook():
             estado_previo = conversaciones[phone].get("estado", "desconocido")
             conversaciones[phone]["estado"] = "soporte_asesor"
             conversaciones[phone]["ultima_interaccion"] = time.time()
-            send_message(phone,
-                "¡Claro que sí! 🙌 Ya mismo le paso tu chat a nuestro asesor principal para que te escriba personalmente.\n\n"
-                "Si prefieres contactarlo directo por WhatsApp, su número es: *" + ADMIN_PHONE_DISPLAY + "*\n\n"
-                "Cuando quieras volver al menú automático, solo escribe *menu*."
+            enviar_botones(phone,
+                "¡Claro que sí! 🙌 Puedes escribirnos directamente a nuestro WhatsApp de soporte tocando el botón de abajo o en este enlace:\n"
+                "👉 " + WHATSAPP_LINK_CORTO + "\n\n"
+                "También le dejé el aviso a nuestro asesor por aquí. Cuando quieras volver al menú automático, solo escribe *menu*.",
+                [{"titulo": "📲 Abrir WhatsApp de Soporte", "url": WHATSAPP_URL}]
             )
+            if not conversaciones[phone].get("telefono"):
+                pedir_telefono(phone, "📲 Si prefieres que nuestro asesor te escriba a ti, déjanos tu número:")
             send_message(ADMIN_PHONE,
-                "🙋 El cliente " + cli(phone) + " pidio hablar con un asesor.\n"
+                "🙋 El cliente " + cli(phone) + " pidio hablar con un asesor (se le envio boton a tu WhatsApp).\n"
                 "Estado en el que estaba: " + str(estado_previo)
             )
             return jsonify({"status": "ok"}), 200
@@ -1888,9 +2059,13 @@ def webhook():
                 return jsonify({"status": "ok"}), 200
 
             if text_lower in ("confirmar_compra", "si", "sí", "yes", "confirmo", "dale", "de una", "claro", "ok"):
-                conversaciones[phone]["estado"] = "preguntar_consola"
                 conversaciones[phone]["msgs_mismo_estado"] = 0
-                enviar_pregunta_consola(phone)
+                if not conversaciones[phone].get("telefono"):
+                    conversaciones[phone]["estado"] = "pedir_contacto_compra"
+                    pedir_telefono(phone, "✅ ¡Excelente! Antes de pasarte a la entrega de tu cuenta:")
+                else:
+                    conversaciones[phone]["estado"] = "preguntar_consola"
+                    enviar_pregunta_consola(phone)
             elif text_lower in ("cancelar_compra", "no", "cancelar"):
                 conversaciones[phone]["estado"] = "menu"
                 send_message(phone, "¡Tranquilo, no hay problema! Si quieres mirar otro plan o tienes alguna pregunta, aquí estoy 😊")
@@ -1906,6 +2081,16 @@ def webhook():
                         {"id": "cancelar_compra", "titulo": "❌ Cancelar"}
                     ]
                 )
+            return jsonify({"status": "ok"}), 200
+
+        # ── PASO: PEDIR NÚMERO DE CONTACTO ANTES DE ENTREGAR CUENTA ──────────
+        if estado == "pedir_contacto_compra":
+            if text_lower in ("omitir", "continuar", "no tengo", "sin numero", "sin número"):
+                conversaciones[phone]["estado"] = "preguntar_consola"
+                conversaciones[phone]["msgs_mismo_estado"] = 0
+                enviar_pregunta_consola(phone)
+            else:
+                pedir_telefono(phone, "🙏 Por favor regálame tu *número de WhatsApp* (escríbelo aquí mismo, ej: 3001234567, o toca el botón de abajo) para continuar con la entrega de tu cuenta:")
             return jsonify({"status": "ok"}), 200
 
         # ── PASO: ¿TIENE CONSOLA/PC DISPONIBLE? ──────────────────────────────
@@ -2340,11 +2525,18 @@ def webhook():
             if text in ("sop_password", "sop_asesor"):
                 estado_previo_sop = conversaciones[phone].get("estado", "desconocido")
                 conversaciones[phone]["estado"] = "soporte_asesor"
-                send_message(phone, "¡Listo! Ya mismo le acabo de pasar el reporte a nuestro asesor técnico para que revise tu cuenta personalmente 🙏\n\nEn breve te escribimos.")
+                enviar_botones(phone,
+                    "¡Listo! Para atenderte de inmediato y revisar tu cuenta personalmente, toca el botón de abajo para ir directo a nuestro WhatsApp de soporte 👇\n\n"
+                    "🔗 Enlace directo: " + WHATSAPP_LINK_CORTO + "\n\n"
+                    "(También le acabo de enviar el reporte a nuestro asesor por aquí 🙏)",
+                    [{"titulo": "📲 Ir a WhatsApp de Soporte", "url": WHATSAPP_URL}]
+                )
+                if not conversaciones[phone].get("telefono"):
+                    pedir_telefono(phone, "📲 Déjanos también tu número por aquí por si nuestro asesor necesita contactarte:")
                 alerta = ("🛠️ SOPORTE - ESCALADO AL ASESOR\nCliente: " + cli(phone) +
                           "\nPaso de soporte previo: " + estado_previo_sop +
                           "\nMotivo/Boton: " + text +
-                          "\nContactalo para ayudarlo manualmente.")
+                          "\nSe le entrego el boton directo a tu WhatsApp.")
                 send_message(ADMIN_PHONE, alerta)
                 return jsonify({"status": "ok"}), 200
 
@@ -2353,21 +2545,32 @@ def webhook():
                 send_message(phone, "🎉 ¡Qué buena noticia! Me alegra mucho que ya haya quedado al 100% 🎮🙌\n\nA disfrutar el juego. Si necesitas algo más, escribe *hola* cuando quieras.")
                 return jsonify({"status": "ok"}), 200
 
-            enviar_botones(phone, "Cuéntame cuál de estos inconvenientes estás presentando para guiarte:", [
-                {"id": "sop_online", "titulo": "🌐 Online no funciona"},
-                {"id": "sop_jugando", "titulo": "👥 Dice 'Alguien más jugando'"},
-                {"id": "sop_password", "titulo": "🔑 Pide contraseña / Otro"}
-            ])
+            enviar_botones(phone,
+                "Cuéntame cuál de estos inconvenientes estás presentando para guiarte paso a paso, o toca el botón de WhatsApp para atención directa:\n\n"
+                "🔗 WhatsApp directo: " + WHATSAPP_LINK_CORTO,
+                [
+                    {"id": "sop_online", "titulo": "🌐 Online no funciona"},
+                    {"id": "sop_jugando", "titulo": "👥 Dice 'Alguien más jugando'"},
+                    {"id": "sop_password", "titulo": "🔑 Pide contraseña / Otro"},
+                    {"titulo": "📲 WhatsApp Soporte Directo", "url": WHATSAPP_URL}
+                ]
+            )
             return jsonify({"status": "ok"}), 200
 
         # ── Menú principal soporte (opcion 3 o texto "soporte") ─────────────
         if text == "3" or text_lower in ("soporte", "soporte tecnico", "soporte técnico"):
             conversaciones[phone]["estado"] = "soporte_menu"
-            enviar_botones(phone, "🛠️ *Soporte Técnico Game Line Col*\n\nCuéntame, ¿con cuál de estos temas necesitas ayuda hoy?", [
-                {"id": "sop_online", "titulo": "🌐 Online no funciona"},
-                {"id": "sop_jugando", "titulo": "👥 Dice 'Alguien más jugando'"},
-                {"id": "sop_password", "titulo": "🔑 Pide contraseña / Otro"}
-            ])
+            enviar_botones(phone,
+                "🛠️ *Soporte Técnico Game Line Col*\n\n"
+                "Elige tu inconveniente abajo para solucionarlo al instante paso a paso, o toca *WhatsApp Soporte Directo* para hablar con nosotros por WhatsApp 👇\n\n"
+                "🔗 Enlace directo: " + WHATSAPP_LINK_CORTO,
+                [
+                    {"id": "sop_online", "titulo": "🌐 Online no funciona"},
+                    {"id": "sop_jugando", "titulo": "👥 Dice 'Alguien más jugando'"},
+                    {"id": "sop_password", "titulo": "🔑 Pide contraseña / Otro"},
+                    {"titulo": "📲 WhatsApp Soporte Directo", "url": WHATSAPP_URL}
+                ]
+            )
             return jsonify({"status": "ok"}), 200
 
         # Si está viendo Game Pass y dice que sí o menciona directamente los meses
